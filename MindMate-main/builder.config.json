@@ -1,0 +1,6 @@
+{
+  "command": "flutter start",
+  "serverUrl": "http://localhost:3000",
+  "authenticateProxy": false,
+  "commitMode": "commits"
+}

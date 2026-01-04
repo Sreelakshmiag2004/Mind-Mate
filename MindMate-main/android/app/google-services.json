@@ -1,0 +1,62 @@
+{
+  "project_info": {
+    "project_number": "302086772846",
+    "project_id": "mindmate-2025",
+    "storage_bucket": "mindmate-2025.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:302086772846:android:7acd857d9bf1dc76466e7f",
+        "android_client_info": {
+          "package_name": "com.oneandwon.mindmate"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "302086772846-39pckf1svg9a74s1vbqusn15m1rskh3a.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.oneandwon.mindmate",
+            "certificate_hash": "1b2f86b3b10ea4a43685ceba7392d122b7cdf0bc"
+          }
+        },
+        {
+          "client_id": "302086772846-hscb07vv82i244f4kjcqotdc6fhl33lt.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.oneandwon.mindmate",
+            "certificate_hash": "d8828ed6a7b78a6c7634619d15ea9e65bff7605f"
+          }
+        },
+        {
+          "client_id": "302086772846-ooks9ek81h4v4a7r2lafgf3st1g0oitu.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAGGlGZyIpiaAYGU7WhJbf2-nnfd5vt-f8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "302086772846-ooks9ek81h4v4a7r2lafgf3st1g0oitu.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "302086772846-574o9ksh6huh3694u8l1mpv8qndrb2rr.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.oneandwon.mindmate"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
