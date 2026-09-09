@@ -34,6 +34,12 @@ os.environ.setdefault("S3_ENDPOINT_URL", "http://unused.invalid:9000")
 os.environ.setdefault("S3_ACCESS_KEY", "unused")
 os.environ.setdefault("S3_SECRET_KEY", "unused")
 os.environ.setdefault("S3_BUCKET_NAME", "unused-test-bucket")
+# Same treatment as the S3_* block above: required by Settings (no
+# default — see app/core/config.py) but never actually dialed. Tests
+# always run with get_ai_provider overridden to MockAIReflectionProvider
+# below, never a real Anthropic API call, so this value only needs to
+# exist for Settings() to validate.
+os.environ.setdefault("AI_API_KEY", "unused-test-key")
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,6 +51,8 @@ from app.core.database import get_db
 from app.main import app
 from app.models import Base
 from app.models.checklist import ChecklistItem
+from app.services.ai import get_ai_provider
+from app.services.ai.mock_provider import MockAIReflectionProvider
 from app.services.storage import get_storage_service
 from app.services.storage.memory_storage import InMemoryStorageService
 
@@ -89,13 +97,21 @@ app.dependency_overrides[get_db] = _override_get_db
 _test_storage = InMemoryStorageService()
 app.dependency_overrides[get_storage_service] = lambda: _test_storage
 
+# Same pattern for Phase 5: a shared MockAIReflectionProvider so tests can
+# both assert on what it was asked to generate (`.calls`) and simulate a
+# provider failure (`.next_error`) without ever depending on a real
+# Anthropic API key or network access. See app/services/ai/mock_provider.py.
+_test_ai_provider = MockAIReflectionProvider()
+app.dependency_overrides[get_ai_provider] = lambda: _test_ai_provider
+
 
 @pytest.fixture(autouse=True)
 def _fresh_schema():
-    """Recreate all tables — and empty the fake bucket — before every test so tests never leak state."""
+    """Recreate all tables — and empty the fake bucket/AI provider state — before every test so tests never leak state."""
     Base.metadata.drop_all(bind=_engine)
     Base.metadata.create_all(bind=_engine)
     _test_storage.clear()
+    _test_ai_provider.reset()
 
     db = _TestingSessionLocal()
     try:
@@ -117,6 +133,12 @@ def client() -> TestClient:
 def storage() -> InMemoryStorageService:
     """The same fake bucket the app is using, for tests to assert against directly."""
     return _test_storage
+
+
+@pytest.fixture()
+def ai_provider() -> MockAIReflectionProvider:
+    """The same mock AI provider the app is using, for tests to assert against or configure `.next_error` on."""
+    return _test_ai_provider
 
 
 @pytest.fixture()

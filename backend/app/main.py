@@ -1,18 +1,19 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, checklists, health, journals, media, moods, relationships, shoutouts, stress
+from app.api.routes import auth, checklists, health, journals, media, moods, reflections, relationships, shoutouts, stress
 from app.core.config import settings
 
 app = FastAPI(
     title="MindMate API",
-    version="0.4.0",
+    version="0.5.0",
     description=(
-        "MindMate backend — Phase 4 (users, profiles, authentication, journals, moods, checklists, "
-        "shoutouts, media/voice-note storage, comfort-person relationships with explicit consent, and "
-        "a deterministic, rule-based stress indicator). This service is entirely independent of "
-        "Firebase; it is the planned replacement, not an extension, of the Flutter app's current "
-        "Firebase Auth/Firestore/Storage backend."
+        "MindMate backend — Phase 5 (users, profiles, authentication, journals, moods, checklists, "
+        "shoutouts, media/voice-note storage, comfort-person relationships with explicit consent, a "
+        "deterministic rule-based stress indicator, and an AI-generated personalized weekly "
+        "reflection built from privacy-controlled activity aggregates). This service is entirely "
+        "independent of Firebase; it is the planned replacement, not an extension, of the Flutter "
+        "app's current Firebase Auth/Firestore/Storage backend."
     ),
 )
 
@@ -33,3 +34,4 @@ app.include_router(shoutouts.router)
 app.include_router(media.router)
 app.include_router(relationships.router)
 app.include_router(stress.router)
+app.include_router(reflections.router)

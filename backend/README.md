@@ -1,4 +1,4 @@
-# MindMate Backend — Phase 4: Comfort-Person Relationships & Stress Indicator
+# MindMate Backend — Phase 5: AI-Generated Weekly Reflection
 
 This is the new MindMate backend: **Python / FastAPI / PostgreSQL / S3-compatible
 object storage**, built to fully replace the Flutter app's current Firebase
@@ -14,15 +14,24 @@ independent build.
   "Shoutout data model" for why it is *not* a messaging feature) and Vault
   media — voice notes, images, videos — stored in S3-compatible object
   storage (MinIO locally) with only metadata in PostgreSQL.
-* **Phase 4** (this phase): comfort-person relationships with explicit,
+* **Phase 4** (done): comfort-person relationships with explicit,
   revocable consent (replacing the old app's unverified `mindmate://invite`
   deep link — see "Relationship & invitation model") and a deterministic,
   rule-based stress indicator (giving real backend substance to
   `favorite_page.dart`'s "View today's stress level" button, currently
   wired to a TODO) that a consented comfort person can view for the person
   they support.
-* **Not yet in scope**: AI (including the weekly reflection), notifications.
-  See "What Phase 4 deliberately does not include" at the end of this file.
+* **Phase 5** (this phase): a personalized, AI-generated weekly reflection —
+  a short, supportive summary of one user's own mood/checklist/journal/
+  shoutout/stress activity over a completed calendar week, built from a
+  privacy-controlled statistical aggregate (never raw journal/shoutout
+  text) and validated against a strict output schema before it is ever
+  stored or returned. See "Weekly reflection architecture" below.
+* **Not yet in scope**: push notifications (including any "your weekly
+  reflection is ready" notification — this phase only builds the
+  generate/retrieve API a future notification would call), and any
+  Flutter integration. See "What Phase 5 deliberately does not include"
+  at the end of this file.
 
 ## 1. Architecture
 
@@ -97,6 +106,52 @@ an accepted relationship and a live `stress_level` consent grant — one
 scoring function, two authorization paths, not two implementations of the
 score.
 
+Phase 5 adds a third axis, alongside the database and object storage: an
+**AI provider** — external, network-bound, and the first dependency in
+this codebase that can fail in ways the app cannot control (a timeout, a
+malformed response, a safety refusal). It is treated exactly like Phase
+3 treated object storage: one abstract interface
+(`AIReflectionProvider`, `app/services/ai/base.py`), one real
+implementation (`AnthropicReflectionProvider`, boto3's role played here
+by the `anthropic` SDK), one test-only fake
+(`MockAIReflectionProvider`), and a factory
+(`app/services/ai/factory.py`) that picks between them — business logic
+is written only against the interface. See "AI provider abstraction"
+below.
+
+The full request flow for a weekly reflection:
+
+```
+FastAPI (app/api/routes/reflections.py)
+   │  auth, request validation
+   ▼
+Reflection Service (app/services/reflection_service.py)
+   │  cache check: does a row already exist for (user, week)?
+   ▼
+Weekly Aggregator (app/services/weekly_aggregation_service.py)
+   │  reads ONLY counts/numbers/enums via the repository layer
+   ▼
+Structured Weekly Summary (app.schemas.reflection.WeeklySummary)
+   │  the ONLY thing that ever reaches the AI provider
+   ▼
+AIReflectionProvider (app/services/ai/*.py)
+   │  validated, structured output only
+   ▼
+WeeklyReflection row (app/models/reflection.py) ── PostgreSQL
+   │
+   ▼
+API response (app.schemas.reflection.WeeklyReflectionRead)
+```
+
+Every box above is a distinct module with a single responsibility, on
+purpose: `reflection_service.py` is the only place that decides
+cache-hit-vs-regenerate; `weekly_aggregation_service.py` is the only
+place that turns raw activity into the structured summary and is the
+enforcement point for the privacy boundary (see "Privacy boundary"
+below); `app/services/ai/*.py` is the only place that ever talks to an
+AI provider's SDK. None of the three imports FastAPI/HTTPException — the
+same framework-agnostic-service-layer rule Phase 1-4 already follows.
+
 ## 2. Folder structure
 
 ```
@@ -104,10 +159,10 @@ backend/
 ├── app/
 │   ├── main.py                    FastAPI app, CORS, router registration
 │   ├── core/
-│   │   ├── config.py              Settings, loaded from environment/.env (incl. Phase 3's S3_*/MAX_UPLOAD_SIZE_MB)
+│   │   ├── config.py              Settings, loaded from environment/.env (incl. Phase 3's S3_*/MAX_UPLOAD_SIZE_MB and Phase 5's AI_*)
 │   │   ├── security.py            Password hashing, JWT, refresh-token hashing
 │   │   ├── database.py            Engine, session factory, get_db dependency
-│   │   └── exceptions.py          Domain exception types (incl. Phase 3's UnsupportedMediaTypeError/FileTooLargeError/StorageError and Phase 4's SelfRelationshipError/PermissionDeniedError)
+│   │   └── exceptions.py          Domain exception types (incl. Phase 3's UnsupportedMediaTypeError/FileTooLargeError/StorageError, Phase 4's SelfRelationshipError/PermissionDeniedError, and Phase 5's AIProviderError family)
 │   ├── models/
 │   │   ├── user.py · profile.py · auth_session.py                 (Phase 1)
 │   │   ├── journal.py · mood.py · checklist.py                    (Phase 2)
@@ -115,21 +170,25 @@ backend/
 │   │   ├── media_asset.py         MediaAsset
 │   │   ├── relationship.py        Relationship
 │   │   ├── relationship_invitation.py   RelationshipInvitation
-│   │   └── relationship_permission.py   RelationshipPermission
+│   │   ├── relationship_permission.py   RelationshipPermission
+│   │   └── reflection.py          WeeklyReflection
 │   ├── schemas/
 │   │   ├── user.py · profile.py · auth.py                         (Phase 1)
 │   │   ├── journal.py · mood.py · checklist.py · common.py        (Phase 2)
 │   │   ├── shoutout.py
 │   │   ├── media.py               MediaAssetRead, MediaAssetDetail
 │   │   ├── relationship.py        InvitationCreate/Read, RelationshipRead, PermissionRead
-│   │   └── stress.py              StressResult (owner view), ComfortStressView (narrower)
+│   │   ├── stress.py              StressResult (owner view), ComfortStressView (narrower)
+│   │   └── reflection.py          WeeklySummary, AIReflectionOutput, WeeklyReflectionRead/GenerateRequest
 │   ├── repositories/
 │   │   ├── user_repository.py · profile_repository.py · auth_session_repository.py   (Phase 1)
 │   │   ├── journal_repository.py · mood_repository.py · checklist_repository.py       (Phase 2)
 │   │   ├── shoutout_repository.py
 │   │   ├── media_repository.py
 │   │   ├── relationship_repository.py · relationship_invitation_repository.py · relationship_permission_repository.py
-│   │   └── stress_repository.py   Aggregate-only reads (averages/counts), never row content
+│   │   ├── stress_repository.py   Aggregate-only reads (averages/counts), never row content
+│   │   ├── weekly_aggregation_repository.py   Journal/shoutout activity by DATE only — never title/content
+│   │   └── reflection_repository.py   CRUD (get-or-upsert) for weekly_reflections
 │   ├── services/
 │   │   ├── auth_service.py                                        (Phase 1)
 │   │   ├── journal_service.py · mood_service.py · checklist_service.py                (Phase 2)
@@ -137,18 +196,26 @@ backend/
 │   │   ├── media_service.py       Upload/list/retrieve/delete + consistency handling
 │   │   ├── relationship_service.py    Invitations, accept/decline, revoke, consent — all authorization rules
 │   │   ├── stress_service.py      The stress-score formula (see "Stress indicator" below); nothing persisted
-│   │   └── storage/
-│   │       ├── base.py            ObjectStorageService (the interface)
-│   │       ├── s3_storage.py      S3StorageService — boto3, works for MinIO or AWS S3
-│   │       ├── memory_storage.py  InMemoryStorageService — test-only fake
-│   │       └── factory.py         get_storage_service() — picks the implementation
+│   │   ├── weekly_aggregation_service.py   Raw activity -> WeeklySummary; the privacy-boundary enforcement point
+│   │   ├── reflection_service.py  Cache check -> aggregate -> AI provider -> persist; see "Weekly reflection architecture"
+│   │   ├── storage/
+│   │   │   ├── base.py            ObjectStorageService (the interface)
+│   │   │   ├── s3_storage.py      S3StorageService — boto3, works for MinIO or AWS S3
+│   │   │   ├── memory_storage.py  InMemoryStorageService — test-only fake
+│   │   │   └── factory.py         get_storage_service() — picks the implementation
+│   │   └── ai/
+│   │       ├── base.py            AIReflectionProvider (the interface)
+│   │       ├── anthropic_provider.py   AnthropicReflectionProvider — the `anthropic` SDK, structured output
+│   │       ├── mock_provider.py   MockAIReflectionProvider — test-only fake
+│   │       └── factory.py         get_ai_provider() — picks the implementation
 │   ├── api/routes/
 │   │   ├── auth.py · health.py                                    (Phase 1)
 │   │   ├── journals.py · moods.py · checklists.py                 (Phase 2)
 │   │   ├── shoutouts.py
 │   │   ├── media.py
 │   │   ├── relationships.py       Invitations, relationships, consent, comfort-person stress view
-│   │   └── stress.py              The authenticated user's own /stress/today and /stress/history
+│   │   ├── stress.py              The authenticated user's own /stress/today and /stress/history
+│   │   └── reflections.py         /reflections/weekly, /reflections/weekly/{week_start}, /reflections/weekly/generate
 │   └── dependencies/
 │       ├── auth.py                get_current_user / get_current_active_user
 │       └── pagination.py          Shared limit/offset query-param dependency
@@ -156,15 +223,17 @@ backend/
 │   ├── a1b2c3d4e5f6_create_users_profiles_auth_sessions.py         (Phase 1)
 │   ├── b2c3d4e5f6a7_create_journals_moods_checklists.py            (Phase 2)
 │   ├── c3d4e5f6a7b8_create_shoutouts_and_media_assets.py           (Phase 3)
-│   └── d4e5f6a7b8c9_create_relationships_invitations_permissions.py (Phase 4)
+│   ├── d4e5f6a7b8c9_create_relationships_invitations_permissions.py (Phase 4)
+│   └── e5f6a7b8c9d0_create_weekly_reflections.py                   (Phase 5)
 ├── tests/
-│   ├── conftest.py                Test app/DB/storage wiring + register_and_get_headers() helper
+│   ├── conftest.py                Test app/DB/storage/AI-provider wiring + register_and_get_headers() helper
 │   ├── test_auth.py               20 tests (Phase 1, unchanged)
 │   ├── test_journals.py · test_moods.py · test_checklists.py       44 tests (Phase 2, unchanged)
 │   ├── test_shoutouts.py          21 tests
 │   ├── test_media.py              19 tests
 │   ├── test_relationships.py      36 tests
-│   └── test_stress.py             12 tests
+│   ├── test_stress.py             12 tests
+│   └── test_reflections.py        36 tests
 ├── Dockerfile · docker-compose.yml · requirements.txt
 ├── .env.example · alembic.ini
 └── README.md                      (this file)
@@ -180,23 +249,29 @@ cd backend
 python -m venv .venv
 source .venv/Scripts/activate      # Windows Git Bash; .venv\Scripts\activate.bat on cmd.exe
 pip install -r requirements.txt
-cp .env.example .env               # then set a real JWT_SECRET_KEY and S3 credentials
+cp .env.example .env               # then set a real JWT_SECRET_KEY, S3 credentials, and AI_API_KEY
 docker compose up --build          # postgres + minio + minio-init + backend, with healthchecks
 ```
 
-Phase 4 adds no new environment variables — relationships/invitations use
-the same `JWT_SECRET_KEY`-adjacent security primitives (see
-`app/core/security.py`'s invitation-token helpers) and the stress indicator
-has no configuration of its own (its window/weights are code constants in
-`app/services/stress_service.py`, not environment-tunable — see "Stress
-indicator" below for why).
+Phase 4 added no new environment variables. **Phase 5 adds four**:
+`AI_PROVIDER` (default `anthropic`), `AI_API_KEY` (a real Anthropic API
+key — see [console.anthropic.com](https://console.anthropic.com/)),
+`AI_MODEL` (default `claude-opus-5`), and `AI_TIMEOUT_SECONDS` (default
+`20`) — see "AI provider abstraction" below for what each controls.
+Nothing else changed: relationships/invitations use the same
+`JWT_SECRET_KEY`-adjacent security primitives (see
+`app/core/security.py`'s invitation-token helpers) and the stress
+indicator has no configuration of its own (its window/weights are code
+constants in `app/services/stress_service.py`, not environment-tunable —
+see "Stress indicator" below for why).
 
 `DATABASE_URL`, `JWT_SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES`,
 `REFRESH_TOKEN_EXPIRE_DAYS`, `CORS_ORIGINS`, `ENVIRONMENT` are the same six
 Phase 1 variables; Phase 3 adds `STORAGE_PROVIDER`, `S3_ENDPOINT_URL`,
 `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET_NAME`, `S3_REGION`, and
-`MAX_UPLOAD_SIZE_MB` (see `.env.example` for all of them, and "Storage
-configuration" below).
+`MAX_UPLOAD_SIZE_MB`; Phase 5 adds the four `AI_*` variables above (see
+`.env.example` for all of them, and "Storage configuration"/"AI provider
+abstraction" below).
 
 > **Verification note, same caveat as Phase 1/2, now covering MinIO too:**
 > this sandbox has neither Docker nor a PostgreSQL server (`docker
@@ -218,8 +293,8 @@ configuration" below).
 ## 5-6. Database setup & Alembic migrations
 
 ```bash
-alembic upgrade head             # applies all four phases' migrations
-alembic downgrade c3d4e5f6a7b8   # roll back to end of Phase 3 (drops relationships/invitations/permissions cleanly)
+alembic upgrade head             # applies all five phases' migrations
+alembic downgrade d4e5f6a7b8c9   # roll back to end of Phase 4 (drops weekly_reflections cleanly)
 alembic current
 alembic history
 ```
@@ -232,18 +307,23 @@ environment ends up with the same catalog row ids). The Phase 3 migration
 (`c3d4e5f6a7b8_create_shoutouts_and_media_assets.py`) creates `shoutouts`
 and `media_assets`. The Phase 4 migration
 (`d4e5f6a7b8c9_create_relationships_invitations_permissions.py`) creates
-`relationships`, `relationship_invitations`, and `relationship_permissions`
-— no seed data, and none of these migrations touch or re-run anything from
-an earlier one. There is no `stress_snapshots` table or similar — the
-stress indicator is computed on demand and never persisted (see "Stress
-indicator" below). See "Shoutout data model", "Supported media types", and
-"Relationship & invitation model" above for the full schema per feature.
+`relationships`, `relationship_invitations`, and `relationship_permissions`.
+The Phase 5 migration (`e5f6a7b8c9d0_create_weekly_reflections.py`)
+creates `weekly_reflections` — no seed data, and none of these migrations
+touch or re-run anything from an earlier one. There is no
+`stress_snapshots` table (the stress indicator is computed on demand and
+never persisted — see "Stress indicator" below), and `weekly_reflections`
+is the ONLY new table Phase 5 adds — no separate "AI request log" or
+"prompt history" table (see "Reflection persistence & caching" below for
+why). See "Shoutout data model", "Supported media types", "Relationship &
+invitation model", and "Weekly reflection architecture" above for the
+full schema per feature.
 
 ## 7. Running the API
 
 Unchanged: `uvicorn app.main:app --reload`. Swagger at `/docs`, ReDoc at
 `/redoc`, raw schema at `/openapi.json`, liveness+DB check at `/health`.
-The OpenAPI title is now "MindMate API" v0.4.0 with the Phase 4 endpoints
+The OpenAPI title is now "MindMate API" v0.5.0 with the Phase 5 endpoints
 included and documented with per-endpoint descriptions (visible in `/docs`).
 
 ## 8. Running tests
@@ -252,10 +332,12 @@ included and documented with per-endpoint descriptions (visible in `/docs`).
 pytest -v
 ```
 
-152 tests total (20 Phase 1 + 44 Phase 2 + 21 shoutouts + 19 media + 36
-relationships/invitations/consent + 12 stress), all against the same
-in-memory SQLite database described in Phase 1's README — see
-`tests/conftest.py`. Media tests never touch a real MinIO/S3: the
+188 tests total (20 Phase 1 + 44 Phase 2 + 21 shoutouts + 19 media + 36
+relationships/invitations/consent + 12 stress + 36 weekly reflections),
+all against the same in-memory SQLite database described in Phase 1's
+README — see `tests/conftest.py`. **No real API keys, network access, or
+running services (PostgreSQL, MinIO, or the Anthropic API) are required
+to run the suite.** Media tests never touch a real MinIO/S3: the
 `get_storage_service` FastAPI dependency is overridden with
 `InMemoryStorageService`, a real (if trivial) implementation of the same
 `ObjectStorageService` interface the running app uses, so "was the object
@@ -264,7 +346,18 @@ actually written / actually removed" is a real assertion (`storage.count()`,
 is emptied before every test alongside the DB reset. One service-level test
 (`test_upload_media_cleans_up_orphaned_object_on_db_failure`) calls
 `media_service.upload_media` directly (bypassing the HTTP layer) to exercise
-the DB-failure-after-successful-upload cleanup path specifically.
+the DB-failure-after-successful-upload cleanup path specifically. Reflection
+tests follow the identical pattern for the AI provider: `get_ai_provider`
+is overridden with `MockAIReflectionProvider`, whose `.calls` list and
+`.next_error` attribute let a test both assert on exactly what
+`WeeklySummary` the "provider" was asked to reflect on (real aggregation
+assertions, not a mock call-count check) and simulate a timeout/malformed-
+response/generic provider failure without any network access — reset
+between tests alongside the DB and the fake storage bucket. Every reflection
+test — including the async `POST /reflections/weekly/generate` route —
+runs through the ordinary synchronous `TestClient`; no `pytest-asyncio` is
+needed (Starlette's `TestClient` already drives the ASGI app's event loop
+internally, the same way `media.py`'s async upload route is already tested).
 
 ## 9. Authentication flow
 
@@ -573,9 +666,71 @@ curl http://localhost:8000/stress/today -H "Authorization: Bearer $ACCESS_TOKEN"
 {"score": null, "level": "insufficient_data", "confidence": "none", "calculated_at": "...", "data_window_start": "...", "data_window_end": "...", "contributors": {"mood_average": null, "checklist_completion_rate": null}, "disclaimer": "This is an automated wellness indicator..."}
 ```
 
-All seven resource families — journals, moods, checklists, shoutouts,
-media, relationships, and the stress indicator — share the same ownership
-rule: **every read, update, and delete is scoped by
+### Weekly reflection
+
+A short, supportive, AI-generated reflection on one completed
+Monday-Sunday week, built entirely from a numeric/statistical summary of
+that week's mood/checklist/journal/shoutout/stress activity — never from
+raw journal or shoutout text. See "Weekly reflection architecture",
+"Privacy boundary", and "AI provider abstraction" below for the full
+design; this section is the API surface only.
+
+| Method | Route | Auth | Purpose |
+|---|---|:---:|---|
+| POST | `/reflections/weekly/generate` | Yes | Generate (or return the cached) reflection for a week |
+| GET | `/reflections/weekly` | Yes | Your most recent reflection — read-only, never generates |
+| GET | `/reflections/weekly/{week_start}` | Yes | One specific week's reflection — 404 if not found or not yours |
+
+`POST .../generate`'s body is entirely optional: `{"week_start": "<a
+Monday, ISO date>", "force_regenerate": false}`. Omitting `week_start`
+defaults to the most recently *completed* week; an explicit `week_start`
+that isn't a Monday, or that refers to a week not yet over, is rejected
+with `400`. Omitting `force_regenerate` (or leaving it `false`) makes the
+whole endpoint a cheap, idempotent cache read once a week has already
+been generated — see "Reflection persistence & caching" for exactly when
+the AI provider is (and is never) called again.
+
+**Example — a week with enough activity:**
+```bash
+curl -X POST http://localhost:8000/reflections/weekly/generate \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
+  -d '{"week_start": "2025-06-02"}'
+```
+```json
+{
+  "id": "...", "user_id": "...", "week_start": "2025-06-02", "week_end": "2025-06-08",
+  "status": "completed",
+  "reflection": {
+    "summary": "...", "mood_insight": "...", "habit_insight": "...",
+    "positive_highlights": ["..."], "areas_to_reflect_on": ["..."], "encouragement": "..."
+  },
+  "insufficient_data_reason": null,
+  "ai_provider": "anthropic", "ai_model": "claude-opus-5",
+  "generated_at": "...", "created_at": "...", "updated_at": "..."
+}
+```
+
+**Example — a week with too little activity to reflect on meaningfully:**
+```json
+{
+  "id": "...", "week_start": "2025-06-09", "week_end": "2025-06-15",
+  "status": "insufficient_data",
+  "reflection": null,
+  "insufficient_data_reason": "No activity was recorded during this week.",
+  "ai_provider": null, "ai_model": null, "generated_at": null,
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+A `502` from `POST .../generate` means the AI provider itself failed
+(timeout, outage, or an unvalidatable response) — see "Failure / retry /
+fallback strategy". Nothing is written to storage in that case, so a
+previously-completed reflection for that week (if any) is left exactly as
+it was.
+
+All eight resource families — journals, moods, checklists, shoutouts,
+media, relationships, the stress indicator, and weekly reflections —
+share the same ownership rule: **every read, update, and delete is scoped by
 the authenticated user's id in the same database query that looks up the
 resource** (`WHERE id = :id AND user_id = :current_user_id`), and `user_id`
 is never accepted from the request body/client on create — it always comes
@@ -651,7 +806,7 @@ Anything else is rejected with `415 Unsupported Media Type`. Validation is
 by **declared** `Content-Type`, not by inspecting file bytes (no
 content-sniffing/magic-byte verification, no antivirus scanning) — an
 explicitly documented limitation, not a claimed security guarantee; see
-"Vault security" below and "What Phase 4 deliberately does not include".
+"Vault security" below and "What Phase 5 deliberately does not include".
 
 **Size limit:** `MAX_UPLOAD_SIZE_MB` (default 25MB), enforced server-side
 against the actual byte count read, before any byte reaches object storage.
@@ -713,6 +868,243 @@ implements**, because doing so without a clear product decision on its
 exact semantics (session-scoped? per-request? biometric-backed like the old
 app's `local_auth` check?) would mean guessing at a security control, which
 is worse than leaving the gap explicit.
+
+## Weekly reflection architecture
+
+See "1. Architecture" above for the full request-flow diagram
+(FastAPI → Reflection Service → Weekly Aggregator → Structured Weekly
+Summary → AI Provider → stored `WeeklyReflection` → API response). This
+section covers the pieces that diagram doesn't show: what a "week" is,
+and how each field of the summary is computed.
+
+**A week is always Monday-Sunday, UTC, and always fully completed** —
+`app/services/reflection_service.resolve_week_start` rejects (`400`) an
+explicit `week_start` that isn't a Monday, or whose Sunday hasn't
+happened yet. Reflecting on a week makes the most sense once it's
+actually over; a partial week's "trend" (see below) would be computed
+from an arbitrary, still-growing slice of data, which is exactly the
+kind of noisy, potentially-misleading signal the safety rules in "Safety
+and tone rules" ask this feature to avoid.
+
+**Every summary field is computed from existing, already-tested
+aggregate queries — Phase 5 adds no new stress algorithm and no new mood
+scale.** `mood_average`/`mood_min`/`mood_max` and
+`checklist_completion_rate` are read via the exact same
+`app/repositories/stress_repository.py` queries `stress_service.py`
+already uses for the stress indicator, so the two features can never
+silently disagree about what "this week's mood average" means.
+`stress_score_start`/`stress_score_end` call
+`stress_service.compute_stress()` itself (not a re-derivation of its
+formula) at two reference dates: `week_end` (whose own trailing 7-day
+window is exactly this week) and `week_start` (whose trailing window is
+mostly the week *before* this one) — giving a legitimate "start of week
+vs. end of week" comparison from one existing, already-tested function
+rather than a second one. `journal_entry_count`/`shoutout_count`/
+`shoutout_positive_feel_better_count` come from
+`app/repositories/weekly_aggregation_repository.py`, a new module that
+reads only an `entry_date` column or the `felt_better` boolean — see
+"Privacy boundary" for why that module's shape is what actually
+enforces the boundary, not a separate runtime check.
+
+**Two trend fields, both simple and explicit:** `mood_trend` compares the
+average of the week's first three days (Mon-Wed) against its last three
+(Fri-Sun), skipping Thursday as a deliberate gap between the two halves;
+`stress_trend` compares `stress_score_start`/`stress_score_end` the same
+way. Both use a fixed, documented threshold
+(`MOOD_TREND_THRESHOLD`/`STRESS_TREND_THRESHOLD = 5` points in
+`app/services/weekly_aggregation_service.py`) rather than any statistical
+significance test — a deliberately simple, auditable rule matching the
+same "transparent, deterministic, not a black box" spirit as Phase 4's
+stress indicator, not a claim of statistical rigor. Either trend reads
+`"insufficient_data"` when there isn't enough data on both sides of the
+comparison to compute one at all.
+
+## Privacy boundary
+
+**The AI provider never receives raw journal/shoutout content, and it is
+structurally impossible for it to, not just policy that says it
+shouldn't.** `app.schemas.reflection.WeeklySummary` — the only object any
+`AIReflectionProvider` implementation is ever given (see
+`app/services/ai/base.py`'s `generate_reflection(self, summary:
+WeeklySummary)` signature) — has no field capable of holding a title or a
+body of text; every field is a count, an average, a min/max, a percentage,
+or an enum. `app/services/weekly_aggregation_service.py`, which builds
+that object, only ever calls `app/repositories/stress_repository.py`
+(pre-existing, aggregate-only) and `app/repositories/
+weekly_aggregation_repository.py` (new in this phase, and itself
+aggregate/date-only — see its module docstring) — neither module's
+functions select `JournalEntry.title`/`.content` or
+`Shoutout.title`/`.content` anywhere. Media (voice/image/video) and
+relationship data are excluded from the summary entirely — media because
+its "content" is a binary blob no aggregation could meaningfully
+summarize anyway, and relationships because they describe *other people*,
+not the reflecting user's own activity.
+
+The one piece of shoutout data that DOES reach the summary is
+`shoutout_positive_feel_better_count` — a count of how many shoutouts
+that week were answered "yes" to the existing "did you feel better?"
+follow-up (see Phase 3's Shoutout data model). It's a boolean tally, never
+text, and was judged worth including because it's a direct, already-
+collected signal of self-reported relief specifically — unlike shoutout
+*content*, which is exactly the kind of raw, un-aggregated venting text
+this boundary exists to keep out of a third-party API call.
+
+**This matches the brief's preferred flow exactly:**
+
+```
+Raw PostgreSQL data (journal/shoutout titles & content, media, etc.)
+        ↓
+Privacy-controlled aggregation (weekly_aggregation_service.py) — reads
+        ONLY counts/dates/numbers via the two aggregate-only repositories
+        ↓
+Structured weekly summary (WeeklySummary) — cannot carry free text at all
+        ↓
+AI provider (app/services/ai/*.py)
+```
+
+**Is journal/shoutout *content* needed for a useful reflection? This
+implementation's answer is no.** Mood (a 0-100 self-report), checklist
+completion, journal/shoutout *activity counts* (did the user engage that
+day, not what they wrote), the feel-better outcome, and the derived
+stress trend already give a rule-based-but-real weekly shape — enough for
+a supportive, pattern-level reflection ("you engaged with journaling most
+days this week" is meaningful without ever reading a word of it). No
+journal/shoutout text is sent, none is optional-with-a-flag, and none of
+it is identifiable to begin with (the AI provider never receives an
+email, a name, or a user id — only aggregate numbers and two ISO dates).
+Nothing beyond the already-completed `WeeklyReflection` row (see
+"Reflection persistence & caching") is stored afterward; the assembled
+prompt string itself is never persisted (see app/models/reflection.py's
+module docstring).
+
+## AI provider abstraction
+
+Mirrors Phase 3's `ObjectStorageService` pattern exactly: one abstract
+interface (`AIReflectionProvider`, `app/services/ai/base.py`, with an
+async `generate_reflection(summary) -> AIReflectionOutput` method plus
+`provider_name`/`model_name` properties for observability), one real
+implementation (`AnthropicReflectionProvider`), and one test-only fake
+(`MockAIReflectionProvider`) — selected by `app/services/ai/factory.py`
+based on `settings.ai_provider`, the same "routes/services depend on a
+FastAPI dependency, never a concrete class" discipline
+`get_storage_service` already established. Swapping in a second real
+provider later means adding one new file plus one line in `factory.py` —
+`app/services/reflection_service.py` and
+`app/services/weekly_aggregation_service.py` would not change at all.
+
+**Why Claude for this first implementation:** this backend is being built
+by Claude Code, and the official `anthropic` Python SDK's structured-
+output helper (`client.messages.parse(..., output_format=
+AIReflectionOutput)`) gave the most directly verifiable integration
+available while writing this phase — it validates the model's JSON
+response against `AIReflectionOutput` server-side and hands back an
+already-parsed, already-validated instance. This is a practical choice
+for the first implementation, not a claim that no other provider could
+satisfy this interface; see `app/services/ai/anthropic_provider.py`'s
+module docstring.
+
+**Configuration is entirely environment-driven** (see "Environment
+variables" below) — `AI_PROVIDER`, `AI_API_KEY`, `AI_MODEL` (default
+`claude-opus-5`), `AI_TIMEOUT_SECONDS` (default 20). No provider secret is
+ever hard-coded, and none is ever persisted to the database (see
+`app/models/reflection.py`'s module docstring). **The test suite never
+requires a real API key or network access**: `tests/conftest.py`
+overrides `get_ai_provider` with a shared `MockAIReflectionProvider`
+instance, exactly like `get_storage_service` is overridden with
+`InMemoryStorageService` — `AI_API_KEY` is set to a throwaway placeholder
+in the test environment purely so `Settings()` itself validates; it is
+never read by any code path a test actually exercises.
+
+**Async, with bounded timeouts and a narrow, typed error surface.**
+`generate_reflection` is `async def`, called from
+`reflection_service.generate_weekly_reflection` (also async) from an
+`async def` FastAPI route — no blocking network call runs on the event
+loop's own thread. `AnthropicReflectionProvider` constructs its client
+with `timeout=settings.ai_timeout_seconds` and `max_retries=1` (not the
+SDK's default of 2): a slow or unreachable provider should fail fast into
+a clean `502` for the caller's current request, not multiply the
+worst-case wall-clock time of a single request — the same reasoning
+`app/services/storage/s3_storage.py` applies to its own boto3 client's
+timeouts. Every failure mode maps to exactly one of three exceptions
+(`AIProviderTimeoutError`, `AIProviderResponseError`, or the base
+`AIProviderError` for anything else — see `app/core/exceptions.py`); the
+provider implementation's own `except Exception` catch-all guarantees no
+SDK-specific exception type can ever escape `app/services/ai/*.py` and
+reach the route layer un-translated.
+
+## AI output schema
+
+`app.schemas.reflection.AIReflectionOutput` — `summary`, `mood_insight`,
+`habit_insight`, `positive_highlights` (list), `areas_to_reflect_on`
+(list), `encouragement` — is enforced two ways at once, not one:
+
+1. **At the provider boundary**, via `client.messages.parse(...,
+   output_format=AIReflectionOutput)` — the Anthropic API's own
+   constrained decoding guarantees the raw JSON matches this schema's
+   shape before the SDK ever hands control back to
+   `anthropic_provider.py`.
+2. **In the schema itself**, via `Field(max_length=...)` on every string
+   (700/400/400/300 chars for summary/mood_insight/habit_insight/
+   encouragement) and every list (max 5 items, each item capped at 200
+   chars) — a concrete bound on response size regardless of provider,
+   not just Claude-specific trust in constrained decoding. A response
+   that violates either guarantee is treated identically: never stored,
+   never returned as if it were valid (see "Failure / retry / fallback
+   strategy" and `app/core/exceptions.py`'s `AIProviderResponseError`).
+
+A safety refusal (`response.stop_reason == "refusal"`) is treated the
+same way — `anthropic_provider.py` raises `AIProviderResponseError`
+rather than ever returning `None`/empty content as if it were a real
+reflection.
+
+## Reflection persistence & caching
+
+**A dedicated table (`weekly_reflections`, `app/models/reflection.py`),
+not a cache layer or a recomputation-on-every-request design** — a
+generated reflection is exactly the kind of small, user-owned, rarely-
+regenerated record the rest of this backend already models as a table
+(one row per user per completed week, `UNIQUE(user_id, week_start)`),
+and persisting it is what makes "call the AI provider at most once per
+user per week" (see below) possible at all.
+
+**Only two statuses exist: `'completed'` and `'insufficient_data'` — a
+third, `'failed'`, was deliberately NOT added.** An AI provider failure
+is never persisted (see `app/services/reflection_service.py`'s module
+docstring for the full reasoning) — a row here means either a reflection
+was actually produced, or the week was conclusively determined to be
+under-active, never "an attempt happened and failed". This also
+sidesteps, by construction, a harder question a `'failed'` status would
+raise: does a failed regeneration attempt get to overwrite a
+previously-completed reflection? It never gets the chance to, because
+nothing is written on failure.
+
+**Caching policy** (`reflection_service.generate_weekly_reflection`):
+
+```
+POST /reflections/weekly/generate
+        │
+        ▼
+Row already exists for (user, week)?
+        ├── YES, and force_regenerate=false → return the stored row.
+        │        No aggregation, no AI call — this is the cost-control
+        │        story for this feature end-to-end.
+        └── NO, or force_regenerate=true → aggregate → sufficient data?
+                 ├── NO  → upsert(status='insufficient_data'), return.
+                 │         (Also cached — a week already determined
+                 │          insufficient stays that way until an explicit
+                 │          force_regenerate.)
+                 └── YES → call the AI provider →
+                          ├── success → upsert(status='completed', ...), return.
+                          └── failure → nothing written; the exception
+                                        propagates to a 502 (see below).
+```
+
+`upsert` (`app/repositories/reflection_repository.py`) is the table's
+only write path — get-or-create keyed by `(user_id, week_start)`, then
+overwritten in place, so `force_regenerate=true` updates the same row
+rather than appending a second one; this is the enforced "no duplicate
+reflections for the same user/week" behavior, verified by
+`tests/test_reflections.py::test_duplicate_generate_calls_never_create_a_second_row`.
 
 ## Design decisions where the existing Flutter app was ambiguous or silent
 
@@ -877,15 +1269,72 @@ is worse than leaving the gap explicit.
   `mindmate://invite?...` deep link, which required no recipient
   authentication and had no expiry.
 
-## What Phase 4 deliberately does not include
+**Phase 5 additions to this list:**
 
-AI (including the weekly reflection itself) and notifications — both
-explicitly out of scope for this phase. Also still not implemented, and
+* **`WeeklySummary` has no field capable of holding journal/shoutout
+  text — this is a schema-level guarantee, not a runtime check that could
+  later be forgotten.** See "Privacy boundary" above; a future change that
+  tried to add raw content to this feature would have to add a new field
+  to do it, not flip a flag.
+* **Only two persisted statuses (`completed`, `insufficient_data`); no
+  `failed` status, and an AI provider failure is never written to the
+  database at all.** See "Reflection persistence & caching" above — this
+  was the deliberate choice over the task brief's suggested `generation
+  status` field, specifically to avoid the harder question of whether a
+  failed regeneration attempt should be allowed to overwrite a
+  previously-completed reflection (it can't, because nothing is ever
+  written on failure).
+* **A "week" is Monday-Sunday, UTC, and must already be fully over before
+  it can be generated.** `POST .../generate` rejects a non-Monday
+  `week_start` or one whose Sunday hasn't happened yet with `400` — see
+  "Weekly reflection architecture". This wasn't specified by the task
+  brief and was a deliberate, explicit choice rather than an implicit
+  "whatever range is convenient".
+* **Trend fields (`mood_trend`, `stress_trend`) use a fixed, documented
+  point threshold, not a statistical test.** A simple, auditable rule
+  matching the same "transparent, not a black box" spirit as the Phase 4
+  stress indicator — seeing the exact number that decided "improving" vs.
+  "stable" is more valuable here than a more sophisticated method whose
+  threshold isn't visible at all.
+* **`stress_score_start`/`stress_score_end` reuse `stress_service.
+  compute_stress()` directly, at two different reference dates, rather
+  than a second, reflection-specific stress calculation.** The brief
+  explicitly disallows a new stress algorithm; reusing the existing
+  function also means the two features can never silently disagree about
+  what a given day's stress score is.
+* **The only shoutout signal that reaches a reflection is a count of
+  positive `felt_better` answers — never any shoutout text, not even
+  optionally.** See "Privacy boundary" above for why journal/shoutout
+  *content* was judged unnecessary for a useful reflection, versus
+  *activity* (did the user engage, and did venting help), which is not
+  itself sensitive free text.
+* **The AI provider is chosen and swappable via one interface
+  (`AIReflectionProvider`) with exactly one real implementation
+  (`AnthropicReflectionProvider`) for this phase.** A second provider
+  is a new file plus one line in `app/services/ai/factory.py`; see "AI
+  provider abstraction" above for why Claude was the practical choice for
+  this first implementation specifically, not a claim about provider
+  quality in general.
+* **The AI's structured output is validated twice — once by the
+  provider's own constrained decoding, once again by this codebase's own
+  `Field(max_length=...)` bounds on `AIReflectionOutput`.** The second
+  check is provider-independent on purpose: it holds even against a
+  future provider implementation that doesn't offer schema-constrained
+  generation at all.
+
+## What Phase 5 deliberately does not include
+
+Push notifications (including any "your weekly reflection is ready"
+notification a client might want to trigger off of this feature) and any
+Flutter integration — both explicitly out of scope for this phase; see
+"Recommended Phase 6" in the Phase 5 implementation report for how a
+notification would plug into the API this phase built without this phase
+needing to build the notification itself. Also still not implemented, and
 explicitly identified rather than guessed at: a Vault-specific
 authorization layer beyond account-level JWT ownership (see "Vault
 security" above), a reconciliation job for the narrow, documented
 database/object-storage inconsistency windows described in
-"Upload/download/delete behavior", and any permission type beyond
+"Upload/download/delete behavior", any permission type beyond
 `stress_level` (the consent model supports adding more `permission_type`
 values later without a schema change, but nothing in the current product
 asks a comfort person to see anything else yet).

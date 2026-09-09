@@ -67,6 +67,25 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
     max_upload_size_mb: int = 25
 
+    # --- AI / Weekly Reflection (Phase 5) ---
+    # "anthropic" is the only implemented provider (see
+    # app/services/ai/anthropic_provider.py for why Claude was chosen for
+    # this first implementation) — same treatment as storage_provider
+    # above: "mock" is test-only, wired via a dependency override in
+    # tests/conftest.py, never selectable through this setting. No
+    # default is given for ai_api_key, same reasoning as jwt_secret_key/
+    # s3_access_key above: a real secret must come from the environment,
+    # never a value baked into this file.
+    ai_provider: str = "anthropic"
+    ai_api_key: str
+    # ALWAYS Claude Opus 5 unless a deployer explicitly overrides it via
+    # AI_MODEL — see backend/README.md, "AI provider abstraction", for why
+    # this default was chosen and how to point it at a cheaper model
+    # (e.g. claude-sonnet-5) instead.
+    ai_model: str = "claude-opus-5"
+    # Bounds a single generation call — see app/services/ai/anthropic_provider.py.
+    ai_timeout_seconds: float = 20.0
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

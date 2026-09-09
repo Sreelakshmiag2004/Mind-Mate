@@ -16,6 +16,7 @@ from app.models.media_asset import MediaAsset
 from app.models.relationship import Relationship
 from app.models.relationship_invitation import RelationshipInvitation
 from app.models.relationship_permission import RelationshipPermission
+from app.models.reflection import WeeklyReflection
 
 __all__ = [
     "Base",
@@ -31,4 +32,5 @@ __all__ = [
     "Relationship",
     "RelationshipInvitation",
     "RelationshipPermission",
+    "WeeklyReflection",
 ]

@@ -95,3 +95,40 @@ class PermissionDeniedError(DomainError):
     revoked, or the owner hasn't granted (or has revoked) the specific
     consent the action requires. Maps to 403, not 404.
     """
+
+
+# --- AI / weekly reflection errors (Phase 5) ---
+#
+# One family, deliberately mirroring how StorageError (Phase 3) is used:
+# a failure in an external, out-of-process dependency (there, object
+# storage; here, an AI provider) maps to a 502, never a 4xx — the
+# request itself was valid, the infrastructure it depends on failed.
+# NotFoundError is reused as-is for "this week's reflection doesn't
+# exist, or isn't yours" (see app/repositories/reflection_repository.py),
+# for the same IDOR-resistance reason every other Phase 1-4 resource
+# relies on it for — no new type needed there.
+
+
+class AIProviderError(DomainError):
+    """
+    Raised when the configured AIReflectionProvider fails for a reason not
+    covered by a narrower subclass below (e.g. an HTTP 5xx from the
+    provider, a connection error). Maps to 502. Every
+    AIReflectionProvider implementation must raise only this class or one
+    of its subclasses — never let a provider-SDK-specific exception
+    escape app/services/ai/*.py.
+    """
+
+
+class AIProviderTimeoutError(AIProviderError):
+    """Raised when the AI provider does not respond within the configured timeout."""
+
+
+class AIProviderResponseError(AIProviderError):
+    """
+    Raised when the AI provider responds, but its output cannot be
+    validated against app.schemas.reflection.AIReflectionOutput (malformed
+    JSON, a missing/oversized field, or a safety refusal). The caller must
+    never store this response as a valid reflection — see
+    app/services/reflection_service.py.
+    """
