@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+
+import 'core/network/api_exception.dart';
 import 'custom_snackbar.dart';
+import 'data/models/journal/journal_model.dart' show parseDateOnly;
+import 'data/repositories/shoutout_repository.dart';
 
 class ShoutoutPage extends StatefulWidget {
   final String? title;
@@ -39,30 +42,64 @@ class _ShoutoutPageState extends State<ShoutoutPage> {
     super.dispose();
   }
 
+  /// Saves this day's Shoutout via `ShoutoutRepository.createOrUpdate`
+  /// (PHASE13 — replacing the old direct Firestore `.set()`, which always
+  /// silently overwrote any existing entry for [widget.dateKey]). Title
+  /// and description must still both be non-empty — PHASE13 Step 4 keeps
+  /// this screen's existing validation as-is even though the backend
+  /// itself allows both fields to be null. [widget.userId] is no longer
+  /// read here: the backend derives the acting user from the Bearer
+  /// token, never from a client-supplied id (PHASE13: "never send
+  /// user_id").
+  ///
+  /// The UI is only updated, and this screen only popped back to
+  /// JournalPage, once the backend confirms the save — never
+  /// optimistically. On failure, the user stays on this page with a
+  /// clear, friendly error and nothing pretends to have succeeded.
   Future<void> _saveShoutout() async {
-    if (widget.userId == null || _titleController.text.trim().isEmpty || _descController.text.trim().isEmpty) {
+    if (_titleController.text.trim().isEmpty || _descController.text.trim().isEmpty) {
       showCustomSnackBar(context, 'Please fill in all fields.');
       return;
     }
     setState(() { _loading = true; });
     try {
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(widget.userId)
-          .collection('shoutouts')
-          .doc(widget.dateKey)
-          .set({
-        'title': _titleController.text.trim(),
-        'description': _descController.text.trim(),
-        'timestamp': FieldValue.serverTimestamp(),
-      });
+      await ShoutoutRepository.instance.createOrUpdate(
+        entryDate: parseDateOnly(widget.dateKey),
+        title: _titleController.text.trim(),
+        content: _descController.text.trim(),
+      );
+      if (!mounted) return;
       showCustomSnackBar(context, 'Shoutout saved!');
       Navigator.of(context).pop(true);
-    } catch (e) {
-      showCustomSnackBar(context, 'Failed to save shoutout.');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyShoutoutError(e), icon: Icons.error_outline);
     } finally {
-      setState(() { _loading = false; });
+      if (mounted) {
+        setState(() { _loading = false; });
+      }
     }
+  }
+
+  /// Maps a Shoutout [ApiException] to a short, clean, user-facing
+  /// message — same approach as `journal_page.dart`'s
+  /// `_friendlyJournalError`. Every status this doesn't specifically name
+  /// falls back to [ApiException.message], already documented as safe to
+  /// show directly.
+  String _friendlyShoutoutError(ApiException e) {
+    if (e is ConflictException) {
+      return "That date's shoutout couldn't be saved — please try again.";
+    }
+    if (e is ValidationException) {
+      return "That shoutout couldn't be saved — please shorten the title or text and try again.";
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong saving your shoutout. Please try again.';
   }
 
   @override

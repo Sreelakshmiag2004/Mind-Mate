@@ -1,5 +1,6 @@
 /// Phase 7 added `/auth/*` and `/health`; Phase 8 added `/journals`; Phase 9
-/// added `/moods`; Phase 10 added `/checklists`; Phase 11B adds `/scheduler`.
+/// added `/moods`; Phase 10 added `/checklists`; Phase 11B added
+/// `/scheduler`; Phase 13 adds `/shoutouts`.
 ///
 /// Still deliberately limited to the features actually wired up so far —
 /// every other backend route (shoutouts, media, relationships, stress,
@@ -60,4 +61,21 @@ class ApiEndpoints {
   /// as [checklistByDate]. See PHASE11B and `backend/app/api/routes/schedulers.py`.
   static const String scheduler = '/scheduler';
   static String schedulerByDate(String entryDate) => '$scheduler/$entryDate';
+
+  /// `GET` (list, with optional `start_date`/`end_date`/`limit`/`offset`
+  /// query params — there is deliberately no `GET /shoutouts/{date}`; a
+  /// date lookup is a `GET /shoutouts?start_date=...&end_date=...&limit=1`
+  /// instead, same approach as [moods]/[journals]) and `POST` (create) both
+  /// live at this exact path — see `backend/app/api/routes/shoutouts.py`.
+  static const String shoutouts = '/shoutouts';
+
+  /// `GET` (retrieve one), `PATCH` (update), and `DELETE` all address a
+  /// single entry by its backend-assigned id — never by date, same pattern
+  /// as [journalById]/[moodById].
+  static String shoutoutById(String shoutoutId) => '$shoutouts/$shoutoutId';
+
+  /// Answers the one-shot "did you feel better?" follow-up for a single
+  /// shoutout, by id. A second call for the same shoutout 409s — see
+  /// PHASE13 backend contract verification report, Section 5.
+  static String shoutoutFeelBetter(String shoutoutId) => '${shoutoutById(shoutoutId)}/feel-better';
 }

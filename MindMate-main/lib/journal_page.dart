@@ -1,17 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'journal_entry_page.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+// PHASE8: Journal data comes from the FastAPI backend via
+// JournalRepository. PHASE13: Shoutout (in this same file/State) has now
+// also moved off Firestore, onto ShoutoutRepository — see the PHASE13
+// implementation report. No Firebase import remains in this file.
 import 'custom_snackbar.dart';
-// PHASE8: Journal data now comes from the FastAPI backend via
-// JournalRepository. cloud_firestore/firebase_auth stay imported above —
-// Shoutout (in this same file/State) still uses them; only Journal's own
-// calls have moved off Firestore. See PHASE8 audit report, Section K.
 import 'core/network/api_exception.dart';
 import 'core/utils/journal_streak.dart';
 import 'data/models/journal/journal_model.dart';
 import 'data/repositories/journal_repository.dart';
+import 'data/repositories/shoutout_repository.dart';
 
 class JournalPage extends StatefulWidget {
   const JournalPage({Key? key}) : super(key: key);
@@ -53,10 +52,17 @@ class _JournalPageState extends State<JournalPage> {
   bool showFeelBetterCongrats = false;
   bool showFeelBetterComfort = false;
 
-  String? get userId {
-    final user = FirebaseAuth.instance.currentUser;
-    return user?.email?.split('@')[0];
-  }
+  /// PHASE13: the backend-assigned id of today's/yesterday's Shoutout
+  /// (whichever exists), same role for Shoutout as [journalEntryId] plays
+  /// for Journal — `null` when that date has no shoutout. Required because
+  /// both `PATCH /shoutouts/{id}` and `POST /shoutouts/{id}/feel-better`
+  /// address a shoutout by id, never by date (there is no
+  /// `GET/PATCH /shoutouts/{date}` — see the PHASE13 backend contract
+  /// verification report, Section 6). Deliberately separate fields from
+  /// [journalEntryId]: a Journal entry and a Shoutout for the same date are
+  /// two unrelated backend resources with their own ids.
+  String? todayShoutoutId;
+  String? yesterdayShoutoutId;
 
   @override
   void initState() {
@@ -67,17 +73,17 @@ class _JournalPageState extends State<JournalPage> {
     _scheduleMidnightReset();
   }
 
-  // PHASE8: Journal reads/writes now go through JournalRepository (FastAPI)
-  // instead of Firestore. Shoutout's Firestore-backed methods below this
-  // point (_loadTodayShoutout, _loadYesterdayShoutout, _saveShoutout,
-  // _setYesterdayFeelBetter, _resetShoutoutLocal) are untouched — see PHASE8
-  // audit report, Section K, for why they must stay on Firestore.
+  // PHASE8: Journal reads/writes go through JournalRepository (FastAPI).
+  // PHASE13: Shoutout's methods below this point (_loadTodayShoutout,
+  // _loadYesterdayShoutout, _setYesterdayFeelBetter, _resetShoutoutLocal)
+  // now go through ShoutoutRepository (FastAPI) too — see the PHASE13
+  // implementation report. The dead _saveShoutout() (an incompatible,
+  // unreferenced Firestore write) was deleted rather than migrated.
 
   /// Loads today's entry (if any) and recomputes the streak. Called from
-  /// `initState` and from the midnight-reset timer. No longer needs
-  /// [userId] at all: the backend derives the acting user from the Bearer
-  /// token `ApiClient` attaches (PHASE8 Step 3), unlike the old Firestore
-  /// path which was keyed by it directly.
+  /// `initState` and from the midnight-reset timer. Doesn't need any
+  /// client-supplied identity: the backend derives the acting user from
+  /// the Bearer token `ApiClient` attaches (PHASE8 Step 3).
   Future<void> _loadTodayJournal() async {
     final today = DateTime.now();
     try {
@@ -216,49 +222,86 @@ class _JournalPageState extends State<JournalPage> {
     return 'Something went wrong saving your journal. Please try again.';
   }
 
+  /// Loads today's shoutout (if any) via `ShoutoutRepository.getForDate`
+  /// (PHASE13 — replacing the old Firestore doc `.get()`). There is no
+  /// `GET /shoutouts/{date}`, so this is a one-day range lookup under the
+  /// hood — see the PHASE13 backend contract verification report, Section
+  /// 6. [todayShoutoutId] is captured here because saving from
+  /// `shoutout_page.dart` needs to know whether a shoutout already exists
+  /// for today, and because `main.dart`'s `/shoutout` route still reads
+  /// this state to prefill that screen.
+  ///
+  /// On failure, whatever was already showing is left untouched — only a
+  /// friendly snackbar is shown, matching every other migrated feature's
+  /// load failure handling in this app.
   Future<void> _loadTodayShoutout() async {
-    if (userId == null) return;
-    final todayKey = _dateKey(DateTime.now());
-    final doc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('shoutouts').doc(todayKey).get();
-    if (doc.exists) {
+    try {
+      final shoutout = await ShoutoutRepository.instance.getForDate(DateTime.now());
+      if (!mounted) return;
       setState(() {
-        todayShoutoutTitle = doc['title'] ?? '';
-        todayShoutoutDescription = doc['description'] ?? '';
+        todayShoutoutId = shoutout?.id;
+        todayShoutoutTitle = shoutout?.title;
+        todayShoutoutDescription = shoutout?.content;
       });
-    } else {
-      setState(() {
-        todayShoutoutTitle = null;
-        todayShoutoutDescription = null;
-      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyShoutoutError(e));
     }
   }
 
+  /// Loads yesterday's shoutout (if any) the same way [_loadTodayShoutout]
+  /// does. [yesterdayFeelBetter] now comes from the backend's persisted
+  /// `felt_better` (PHASE13 fixes the old app's bug: it read
+  /// `doc['feelBetter']` but nothing ever wrote it — see the PHASE13
+  /// backend contract verification report, Section 5), so
+  /// [showFeelBetterCongrats]/[showFeelBetterComfort] are derived from it
+  /// right here too — otherwise a returning user whose answer already
+  /// persisted would see the Yes/No prompt again instead of their actual
+  /// outcome.
   Future<void> _loadYesterdayShoutout() async {
-    if (userId == null) return;
-    final yesterday = DateTime.now().subtract(const Duration(days: 1));
-    final yesterdayKey = _dateKey(yesterday);
-    final doc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('shoutouts').doc(yesterdayKey).get();
-    if (doc.exists) {
+    try {
+      final yesterday = DateTime.now().subtract(const Duration(days: 1));
+      final shoutout = await ShoutoutRepository.instance.getForDate(yesterday);
+      if (!mounted) return;
       setState(() {
-        yesterdayShoutoutTitle = doc['title'] ?? '';
-        yesterdayFeelBetter = doc['feelBetter'];
+        yesterdayShoutoutId = shoutout?.id;
+        yesterdayShoutoutTitle = shoutout?.title;
+        yesterdayFeelBetter = shoutout?.feltBetter;
+        showFeelBetterCongrats = shoutout?.feltBetter == true;
+        showFeelBetterComfort = shoutout?.feltBetter == false;
       });
-    } else {
-      setState(() {
-        yesterdayShoutoutTitle = null;
-        yesterdayFeelBetter = null;
-      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyShoutoutError(e));
     }
+  }
+
+  /// Maps a Shoutout [ApiException] to a short, clean, user-facing
+  /// message — same approach as [_friendlyJournalError]. Every status this
+  /// doesn't specifically name falls back to [ApiException.message],
+  /// already documented as safe to show directly.
+  String _friendlyShoutoutError(ApiException e) {
+    if (e is ConflictException) {
+      return "That date's shoutout couldn't be saved — please try again.";
+    }
+    if (e is ValidationException) {
+      return "That shoutout couldn't be saved — please shorten the title or text and try again.";
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong with your shoutout. Please try again.';
   }
 
   void _resetShoutoutLocal() {
     setState(() {
+      todayShoutoutId = null;
       todayShoutoutTitle = null;
       todayShoutoutDescription = null;
+      yesterdayShoutoutId = null;
       yesterdayShoutoutTitle = null;
     });
   }
@@ -295,40 +338,52 @@ class _JournalPageState extends State<JournalPage> {
     super.dispose();
   }
 
-  Future<void> _saveShoutout() async {
-    if (userId == null || problemController.text.trim().isEmpty) {
-      showCustomSnackBar(context, 'Please enter a problem.');
-      return;
-    }
-    try {
-      final problemText = problemController.text.trim();
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(userId)
-          .collection('shoutouts')
-          .add({
-        'problem': problemText,
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-      showCustomSnackBar(context, 'Shoutout added!');
-      problemController.clear();
-      setState(() {
-        selectedIssue = problemText;
-      });
-    } catch (e) {
-      showCustomSnackBar(context, 'Failed to add shoutout.');
-    }
-  }
+  // PHASE13: the old _saveShoutout() here (an unreferenced, dead method —
+  // confirmed by the PHASE12 audit and `flutter analyze` — that wrote an
+  // auto-id Firestore doc in a shape ({'problem': ..., 'timestamp': ...})
+  // no read path ever consumed) has been deleted rather than migrated. See
+  // the PHASE13 backend contract verification report and implementation
+  // report for the full audit trail.
 
+  /// Answers yesterday's "did you feel better?" follow-up via
+  /// `POST /shoutouts/{id}/feel-better` (PHASE13 — replacing the old
+  /// implementation, which only ever called `setState()` and never
+  /// persisted anything: a confirmed bug, not a design choice, per the
+  /// PHASE13 backend contract verification report, Section 5).
+  ///
+  /// [yesterdayShoutoutId] is required — if it's `null` (no shoutout was
+  /// recorded yesterday, so there is nothing to answer), this does
+  /// nothing rather than send an invalid request.
+  ///
+  /// The UI is only updated once the backend confirms the answer — never
+  /// optimistically. The backend's `felt_better` is strictly one-shot: a
+  /// second attempt for the same shoutout 409s. That is NOT treated as a
+  /// failure here — it means this exact question was already answered (by
+  /// this screen, another device, or a retry), so yesterday's shoutout is
+  /// re-fetched and the UI is driven from whatever the backend actually
+  /// has stored, exactly as [_loadYesterdayShoutout] would show on a fresh
+  /// load, rather than fighting the backend's one-shot rule with a
+  /// generic error.
   Future<void> _setYesterdayFeelBetter(bool value) async {
-    setState(() {
-      yesterdayFeelBetter = value;
-      if (value == true) {
-        showFeelBetterCongrats = true;
-      } else {
-        showFeelBetterComfort = true;
-      }
-    });
+    final shoutoutId = yesterdayShoutoutId;
+    if (shoutoutId == null) return;
+
+    try {
+      final updated = await ShoutoutRepository.instance.answerFeelBetter(shoutoutId, value);
+      if (!mounted) return;
+      setState(() {
+        yesterdayFeelBetter = updated.feltBetter;
+        showFeelBetterCongrats = updated.feltBetter == true;
+        showFeelBetterComfort = updated.feltBetter == false;
+      });
+    } on ConflictException {
+      // Already answered (one-shot) — re-fetch and show the persisted
+      // outcome instead of a generic error, per PHASE13 Step 6.
+      await _loadYesterdayShoutout();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyShoutoutError(e));
+    }
   }
 
   @override
@@ -783,12 +838,21 @@ class _JournalPageState extends State<JournalPage> {
                                 elevation: 0,
                               ),
                               onPressed: () async {
-                                // Navigate to shoutout page for add/edit
+                                // Navigate to shoutout page for add/edit.
+                                // PHASE13: 'userId' is passed as null —
+                                // ShoutoutPage/ShoutoutRepository no longer
+                                // use it for anything; the backend derives
+                                // the acting user from the Bearer token.
+                                // Kept as a key only because
+                                // ShoutoutPage's constructor still declares
+                                // a `required this.userId` parameter (of
+                                // nullable type), unchanged to keep this
+                                // surgical.
                                 final result = await Navigator.pushNamed(context, '/shoutout', arguments: {
                                   'title': todayShoutoutTitle,
                                   'description': todayShoutoutDescription,
                                   'dateKey': _dateKey(DateTime.now()),
-                                  'userId': userId,
+                                  'userId': null,
                                 });
                                 if (result == true) {
                                   _loadTodayShoutout();
