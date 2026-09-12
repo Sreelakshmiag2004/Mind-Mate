@@ -4,4 +4,10 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Phase 7: permits plain-HTTP calls to a local FastAPI dev server —
+         see res/xml/network_security_config.xml (debug-only) and
+         API_CONFIGURATION.md. This <application> element is merged into
+         the main manifest's for debug builds only. -->
+    <application android:networkSecurityConfig="@xml/network_security_config" />
 </manifest>

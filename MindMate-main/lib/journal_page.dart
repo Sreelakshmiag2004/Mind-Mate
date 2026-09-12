@@ -4,6 +4,14 @@ import 'journal_entry_page.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'custom_snackbar.dart';
+// PHASE8: Journal data now comes from the FastAPI backend via
+// JournalRepository. cloud_firestore/firebase_auth stay imported above —
+// Shoutout (in this same file/State) still uses them; only Journal's own
+// calls have moved off Firestore. See PHASE8 audit report, Section K.
+import 'core/network/api_exception.dart';
+import 'core/utils/journal_streak.dart';
+import 'data/models/journal/journal_model.dart';
+import 'data/repositories/journal_repository.dart';
 
 class JournalPage extends StatefulWidget {
   const JournalPage({Key? key}) : super(key: key);
@@ -24,6 +32,20 @@ class _JournalPageState extends State<JournalPage> {
   String entryTitle = '';
   String entryDescription = '';
   int streak = 0;
+
+  /// PHASE8: the backend-assigned id of the currently-loaded entry (whatever
+  /// date that is — today's when set by `_loadTodayJournal`, or the viewed
+  /// date's when set by `_loadJournalForDate`). `null` when that date has no
+  /// entry. Saving today's entry uses this to decide `PATCH` (id known) vs.
+  /// `POST` (id null) — see `JournalRepository.createOrUpdate` and PHASE8
+  /// Step 4/Step 6. The old Firestore scheme needed no equivalent: the date
+  /// itself was the document id.
+  String? journalEntryId;
+
+  /// How many days of history one `getEntriesForRange` call fetches to
+  /// compute the streak (PHASE8 Step 11) — comfortably covers any realistic
+  /// streak in a single request without ever requesting one day at a time.
+  static const int _streakLookbackDays = 60;
   String? todayShoutoutTitle;
   String? todayShoutoutDescription;
   String? yesterdayShoutoutTitle;
@@ -45,92 +67,153 @@ class _JournalPageState extends State<JournalPage> {
     _scheduleMidnightReset();
   }
 
+  // PHASE8: Journal reads/writes now go through JournalRepository (FastAPI)
+  // instead of Firestore. Shoutout's Firestore-backed methods below this
+  // point (_loadTodayShoutout, _loadYesterdayShoutout, _saveShoutout,
+  // _setYesterdayFeelBetter, _resetShoutoutLocal) are untouched — see PHASE8
+  // audit report, Section K, for why they must stay on Firestore.
+
+  /// Loads today's entry (if any) and recomputes the streak. Called from
+  /// `initState` and from the midnight-reset timer. No longer needs
+  /// [userId] at all: the backend derives the acting user from the Bearer
+  /// token `ApiClient` attaches (PHASE8 Step 3), unlike the old Firestore
+  /// path which was keyed by it directly.
   Future<void> _loadTodayJournal() async {
-    if (userId == null) return;
-    final todayKey = _dateKey(DateTime.now());
-    final doc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('journals').doc(todayKey).get();
-    if (doc.exists) {
+    final today = DateTime.now();
+    try {
+      final entry = await JournalRepository.instance.getForDate(today);
+      final newStreak = await _computeStreak(today);
+      if (!mounted) return;
       setState(() {
-        hasEntry = true;
-        entryTitle = doc['title'] ?? '';
-        entryDescription = doc['description'] ?? '';
-        streak = doc['streak'] ?? 0;
-        showCongrats = true;
+        _applyLoadedEntry(entry);
+        streak = newStreak;
       });
-    } else {
-      setState(() {
-        hasEntry = false;
-        entryTitle = '';
-        entryDescription = '';
-        showCongrats = false;
-      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyJournalError(e));
     }
   }
 
+  /// Saves [title]/[description] for [date] (in practice, always today —
+  /// the UI only allows writing/editing today's entry, enforced by the
+  /// button's own `onPressed` gate below, PHASE8 Step 8).
+  ///
+  /// PHASE8 Step 9: unlike the old Firestore `.set()`, this call can
+  /// genuinely fail (network, 401-after-failed-refresh, 409, 422, ...). The
+  /// UI is therefore no longer updated optimistically before this runs —
+  /// callers await this method and it alone decides what the screen shows,
+  /// only after the backend confirms the save. On failure, the screen is
+  /// rolled back to its last known-good state and a clean, non-technical
+  /// message is shown instead of leaving the UI claiming the entry saved.
   Future<void> _saveJournal(String title, String description, DateTime date) async {
-    if (userId == null) return;
-    final dateKey = _dateKey(date);
-    int newStreak = await _calculateStreak(dateKey);
-    await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('journals').doc(dateKey)
-        .set({
-      'title': title,
-      'description': description,
-      'date': dateKey,
-      'streak': newStreak,
-    });
-    setState(() {
-      hasEntry = true;
-      entryTitle = title;
-      entryDescription = description;
-      streak = newStreak;
-      showCongrats = true;
-    });
-  }
-
-  Future<void> _loadJournalForDate(DateTime date) async {
-    if (userId == null) return;
-    final dateKey = _dateKey(date);
-    final doc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('journals').doc(dateKey).get();
-    if (doc.exists) {
+    final previousHasEntry = hasEntry;
+    final previousEntryId = journalEntryId;
+    final previousTitle = entryTitle;
+    final previousDescription = entryDescription;
+    final previousStreak = streak;
+    final previousShowCongrats = showCongrats;
+    try {
+      final saved = await JournalRepository.instance.createOrUpdate(
+        entryDate: date,
+        existingId: journalEntryId,
+        title: title,
+        content: description,
+      );
+      final newStreak = await _computeStreak(DateTime.now());
+      if (!mounted) return;
       setState(() {
         hasEntry = true;
-        entryTitle = doc['title'] ?? '';
-        entryDescription = doc['description'] ?? '';
-        streak = doc['streak'] ?? 0;
+        journalEntryId = saved.id;
+        entryTitle = saved.title ?? '';
+        entryDescription = saved.content ?? '';
+        streak = newStreak;
         showCongrats = true;
       });
-    } else {
+    } on ApiException catch (e) {
+      if (!mounted) return;
       setState(() {
-        hasEntry = false;
-        entryTitle = '';
-        entryDescription = '';
-        showCongrats = false;
-        streak = 0;
+        hasEntry = previousHasEntry;
+        journalEntryId = previousEntryId;
+        entryTitle = previousTitle;
+        entryDescription = previousDescription;
+        streak = previousStreak;
+        showCongrats = previousShowCongrats;
       });
+      showCustomSnackBar(context, _friendlyJournalError(e));
     }
   }
 
-  Future<int> _calculateStreak(String todayKey) async {
-    if (userId == null) return 1;
-    final yesterday = DateTime.now().subtract(const Duration(days: 1));
-    final yesterdayKey = _dateKey(yesterday);
-    final yesterdayDoc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('journals').doc(yesterdayKey).get();
-    if (yesterdayDoc.exists) {
-      int prevStreak = yesterdayDoc['streak'] ?? 0;
-      // Check if yesterday's entry was consecutive
-      return prevStreak + 1;
-    } else {
-      // Missed a day, reset streak
-      return 1;
+  /// Loads the entry for an arbitrary [date] — used by the date picker's
+  /// "View" flow, and internally before deciding Write vs. Edit mode for
+  /// today. Deliberately does not touch [streak]: streak is a single,
+  /// today-relative value (PHASE8 Step 11) owned by [_loadTodayJournal] and
+  /// [_saveJournal], not a per-entry value the old Firestore doc's `streak`
+  /// field used to be — viewing a past date's entry no longer overwrites it.
+  Future<void> _loadJournalForDate(DateTime date) async {
+    try {
+      final entry = await JournalRepository.instance.getForDate(date);
+      if (!mounted) return;
+      setState(() => _applyLoadedEntry(entry));
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyJournalError(e));
     }
+  }
+
+  /// Shared by [_loadTodayJournal] and [_loadJournalForDate]: applies a
+  /// loaded (or absent) entry to the Journal fields. Must be called from
+  /// inside a `setState`.
+  void _applyLoadedEntry(JournalModel? entry) {
+    if (entry != null) {
+      hasEntry = true;
+      journalEntryId = entry.id;
+      entryTitle = entry.title ?? '';
+      entryDescription = entry.content ?? '';
+      showCongrats = true;
+    } else {
+      hasEntry = false;
+      journalEntryId = null;
+      entryTitle = '';
+      entryDescription = '';
+      showCongrats = false;
+    }
+  }
+
+  /// PHASE8 Step 11: fetches one window of history ending at [today] in a
+  /// single list request (never one request per day) and computes the
+  /// consecutive-day streak from the real entry dates it returns — see
+  /// `core/utils/journal_streak.dart` for the actual counting logic, kept
+  /// separate so it can be unit-tested without any network involved.
+  Future<int> _computeStreak(DateTime today) async {
+    final rangeStart = DateTime(
+      today.year,
+      today.month,
+      today.day,
+    ).subtract(const Duration(days: _streakLookbackDays - 1));
+    final entries = await JournalRepository.instance.getEntriesForRange(rangeStart, today, limit: 100);
+    return calculateJournalStreak(entries.map((e) => e.entryDate), today: today);
+  }
+
+  /// Maps a Journal [ApiException] to a short, clean, user-facing message —
+  /// PHASE8 Step 9 asks specifically for network / 401 / 409 / 422 to each
+  /// read sensibly for this screen; every other status falls back to
+  /// [ApiException.message], which is already documented as safe to show
+  /// directly (see `api_exception.dart`'s class doc) — never a raw
+  /// exception string or stack trace.
+  String _friendlyJournalError(ApiException e) {
+    if (e is ConflictException) {
+      return 'You already have a journal entry for that date.';
+    }
+    if (e is ValidationException) {
+      return "That journal entry couldn't be saved — please shorten the title or text and try again.";
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong saving your journal. Please try again.';
   }
 
   Future<void> _loadTodayShoutout() async {
@@ -190,7 +273,8 @@ class _JournalPageState extends State<JournalPage> {
         entryTitle = '';
         entryDescription = '';
         showCongrats = false;
-        // Do not reset streak here, as it is managed by Firestore
+        // Do not reset streak here — it's recomputed from the backend by
+        // _loadTodayJournal() below, once the new day's data is loaded.
         showFeelBetterCongrats = false;
         showFeelBetterComfort = false;
         yesterdayFeelBetter = null;
@@ -567,13 +651,15 @@ class _JournalPageState extends State<JournalPage> {
                                                           ),
                                                         );
                                                         if (result is Map) {
-                                                          setState(() {
-                                                            hasEntry = true;
-                                                            entryTitle = result['title'] ?? '';
-                                                            entryDescription = result['description'] ?? '';
-                                                            showCongrats = true;
-                                                          });
-                                                          _saveJournal(entryTitle, entryDescription, selectedDate);
+                                                          // PHASE8 Step 9: no optimistic setState here anymore —
+                                                          // _saveJournal itself only updates the UI once the
+                                                          // backend confirms the save, and rolls back with an
+                                                          // error snackbar if it fails.
+                                                          await _saveJournal(
+                                                            (result['title'] as String?) ?? '',
+                                                            (result['description'] as String?) ?? '',
+                                                            selectedDate,
+                                                          );
                                                         }
                                                       } else {
                                                         // Write mode
@@ -587,13 +673,11 @@ class _JournalPageState extends State<JournalPage> {
                                                           ),
                                                         );
                                                         if (result is Map) {
-                                                          setState(() {
-                                                            hasEntry = true;
-                                                            entryTitle = result['title'] ?? '';
-                                                            entryDescription = result['description'] ?? '';
-                                                            showCongrats = true;
-                                                          });
-                                                          _saveJournal(entryTitle, entryDescription, selectedDate);
+                                                          await _saveJournal(
+                                                            (result['title'] as String?) ?? '',
+                                                            (result['description'] as String?) ?? '',
+                                                            selectedDate,
+                                                          );
                                                         }
                                                       }
                                                     }

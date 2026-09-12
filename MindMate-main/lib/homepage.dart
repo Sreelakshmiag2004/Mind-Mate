@@ -9,6 +9,16 @@ import 'journal_page.dart';
 import 'vault_password.dart';
 import 'settings_page.dart';
 import 'package:hive/hive.dart';
+// PHASE9: Mood data now comes from the FastAPI backend via MoodRepository.
+// cloud_firestore/firebase_auth stay imported above — Checklist and
+// Scheduler (in this same file/State) still use them (Checklist via
+// Firestore, Scheduler via Hive); only Mood's own calls have moved off
+// Firestore. See PHASE9 audit report, Section J.
+import 'custom_snackbar.dart';
+import 'core/network/api_exception.dart';
+import 'data/models/journal/journal_model.dart' show formatDateOnly;
+import 'data/models/mood/mood_model.dart';
+import 'data/repositories/mood_repository.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({Key? key}) : super(key: key);
@@ -65,6 +75,22 @@ class _HomePageState extends State<HomePage> {
 
   // 4. Mood data per day (key: yyyy-mm-dd)
   Map<String, int> moodPercentData = {};
+
+  /// PHASE9: the backend-assigned id of the mood entry for each date
+  /// currently loaded into [moodPercentData] (same `yyyy-mm-dd` keys).
+  /// Populated whenever a visible range is fetched or a mood is
+  /// saved — used so `MoodRepository.update` can address an existing entry
+  /// by its real id rather than by date. The old Firestore scheme needed no
+  /// equivalent: the date itself was the document id.
+  Map<String, String> moodEntryIds = {};
+
+  /// The exact half-month range last successfully fetched from the backend
+  /// (PHASE9 Step 5 — load only the visible calendar range, not the user's
+  /// entire mood history). `null` until the first load. Used by
+  /// `_loadMoodsForVisibleRange` to avoid re-fetching a range that's
+  /// already loaded (e.g. a rebuild that doesn't change the visible period).
+  DateTime? _loadedMoodRangeStart;
+  DateTime? _loadedMoodRangeEnd;
 
   // Add state for calendar half view
   bool showFirstHalf = true;
@@ -149,20 +175,12 @@ class _HomePageState extends State<HomePage> {
     await box.put(todayKey, schedule);
   }
 
-  Future<void> loadMoods() async {
-    final snapshot = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('moods').get();
-
-    Map<String, int> allMoods = {};
-    for (var doc in snapshot.docs) {
-      final items = Map<String, int>.from(doc['items']);
-      allMoods.addAll(items);
-    }
-    setState(() {
-      moodPercentData = allMoods;
-    });
-  }
+  // PHASE9: Mood reads/writes now go through MoodRepository (FastAPI)
+  // instead of Firestore. `saveMoods()` directly below is confirmed dead
+  // code (nothing in this file calls it — see PHASE9 audit report, Section
+  // B) and is deliberately left untouched rather than migrated, per this
+  // phase's scope. Checklist's/Scheduler's own load/save methods above this
+  // point are untouched.
   Future<void> saveMoods() async {
     await FirebaseFirestore.instance
         .collection('users').doc(userId)
@@ -170,19 +188,104 @@ class _HomePageState extends State<HomePage> {
         .set({'items': moodPercentData});
   }
 
-  Future<void> saveMoodForDate(String dateKey, int percent) async {
-    final docRef = FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('moods').doc(dateKey);
+  /// Loads moods for exactly the currently visible calendar range (the
+  /// active half-month per `selectedYear`/`selectedMonth`/`showFirstHalf`)
+  /// via `GET /moods?start_date=&end_date=`, replacing the old
+  /// `loadMoods()`'s unconditional full-collection Firestore read (PHASE9
+  /// audit report, Section I.1 — the decision was to load by visible range,
+  /// not the entire history, and not an arbitrary fixed cutoff).
+  ///
+  /// Skips the network call entirely if this exact range was the last one
+  /// successfully loaded (`_loadedMoodRangeStart`/`_loadedMoodRangeEnd`),
+  /// so repeated rebuilds of the same visible period don't refetch. Called
+  /// from `initState` and after every month/half-month navigation.
+  ///
+  /// On failure, already-loaded data in [moodPercentData]/[moodEntryIds] is
+  /// left untouched (PHASE9 Step 9) — only a snackbar is shown.
+  Future<void> _loadMoodsForVisibleRange() async {
+    final visibleDays = getVisibleDays(selectedYear, selectedMonth, showFirstHalf);
+    if (visibleDays.isEmpty) return;
+    final rangeStart = DateTime(selectedYear, selectedMonth, visibleDays.first);
+    final rangeEnd = DateTime(selectedYear, selectedMonth, visibleDays.last);
 
-    final doc = await docRef.get();
-    Map<String, int> items = {};
-    if (doc.exists) {
-      items = Map<String, int>.from(doc['items']);
+    if (rangeStart == _loadedMoodRangeStart && rangeEnd == _loadedMoodRangeEnd) {
+      return;
     }
-    items[dateKey] = percent;
 
-    await docRef.set({'items': items});
+    try {
+      final entries = await MoodRepository.instance.getEntriesForRange(startDate: rangeStart, endDate: rangeEnd);
+      if (!mounted) return;
+      setState(() {
+        // Clear any stale entries for exactly this range before
+        // repopulating, so a mood moved off one of these dates (the
+        // backend supports changing entry_date via PATCH, even though this
+        // UI never does) doesn't linger as a ghost entry. Dates outside
+        // this range (other months/halves already loaded) are untouched.
+        for (final day in visibleDays) {
+          final key = formatDateOnly(DateTime(selectedYear, selectedMonth, day));
+          moodPercentData.remove(key);
+          moodEntryIds.remove(key);
+        }
+        for (final entry in entries) {
+          final key = formatDateOnly(entry.entryDate);
+          moodPercentData[key] = entry.moodValue;
+          moodEntryIds[key] = entry.id;
+        }
+        _loadedMoodRangeStart = rangeStart;
+        _loadedMoodRangeEnd = rangeEnd;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyMoodError(e));
+    }
+  }
+
+  /// Saves [percent] for [date] (identified by its `yyyy-mm-dd` [dateKey]),
+  /// via `MoodRepository.createOrUpdate` — replacing the old
+  /// `saveMoodForDate`'s read-merge-write against a single-key nested
+  /// Firestore map (see PHASE9 audit report, Section C).
+  ///
+  /// PHASE9 Step 6: no optimistic update — [moodPercentData]/[moodEntryIds]
+  /// are only updated after the backend confirms the save, from the
+  /// returned [MoodModel]. Returns `true` on success (so the caller knows
+  /// whether to show the existing success dialog) and `false` on failure,
+  /// after showing a friendly snackbar and leaving prior state untouched.
+  Future<bool> saveMoodForDate(String dateKey, DateTime date, int percent) async {
+    try {
+      final saved = await MoodRepository.instance.createOrUpdate(entryDate: date, moodValue: percent);
+      if (!mounted) return false;
+      setState(() {
+        moodPercentData[dateKey] = saved.moodValue;
+        moodEntryIds[dateKey] = saved.id;
+      });
+      return true;
+    } on ApiException catch (e) {
+      if (!mounted) return false;
+      showCustomSnackBar(context, _friendlyMoodError(e));
+      return false;
+    }
+  }
+
+  /// Maps a Mood [ApiException] to a short, clean, user-facing message —
+  /// same approach as `journal_page.dart`'s `_friendlyJournalError`. Every
+  /// status this doesn't specifically name falls back to
+  /// [ApiException.message], which is already documented as safe to show
+  /// directly (see `api_exception.dart`'s class doc) — never a raw
+  /// exception string or stack trace.
+  String _friendlyMoodError(ApiException e) {
+    if (e is ConflictException) {
+      return 'You already have a mood entry for that date.';
+    }
+    if (e is ValidationException) {
+      return 'That mood value could not be saved — please enter a number between 0 and 100.';
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong saving your mood. Please try again.';
   }
 
   Future<void> saveSchedulerForDate(String dateKey, Map<String, String> schedule) async {
@@ -227,7 +330,7 @@ class _HomePageState extends State<HomePage> {
     Firebase.initializeApp().then((_) async {
       await loadChecklist();
       await loadScheduler();
-      await loadMoods();
+      await _loadMoodsForVisibleRange();
       _scheduleMidnightReset();
     });
   }
@@ -569,6 +672,9 @@ class _HomePageState extends State<HomePage> {
                                 showFirstHalf = true;
                               }
                             });
+                            // PHASE9: the visible half-month just changed —
+                            // load moods for the newly visible range.
+                            _loadMoodsForVisibleRange();
                           },
                         ),
                         Text(
@@ -594,6 +700,9 @@ class _HomePageState extends State<HomePage> {
                                 showFirstHalf = false;
                               }
                             });
+                            // PHASE9: the visible half-month just changed —
+                            // load moods for the newly visible range.
+                            _loadMoodsForVisibleRange();
                           },
                         ),
                       ],
@@ -618,7 +727,11 @@ class _HomePageState extends State<HomePage> {
                         DateTime cellDate = DateTime(selectedYear, selectedMonth, day);
                         DateTime today = DateTime.now();
                         DateTime yesterday = today.subtract(const Duration(days: 1));
-                        String key = '${selectedYear.toString().padLeft(4, '0')}-${selectedMonth.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}';
+                        // PHASE9: consolidated onto the shared formatDateOnly
+                        // helper (see PHASE9 audit report, Section H) —
+                        // was a third, independently-written yyyy-MM-dd
+                        // formatter in this same file.
+                        String key = formatDateOnly(cellDate);
                         bool isToday = cellDate.year == today.year && cellDate.month == today.month && cellDate.day == today.day;
                         bool isYesterday = cellDate.year == yesterday.year && cellDate.month == yesterday.month && cellDate.day == yesterday.day;
                         int? percent = moodPercentData[key];
@@ -655,10 +768,15 @@ class _HomePageState extends State<HomePage> {
                               },
                             );
                             if (entered != null) {
-                              setState(() {
-                                moodPercentData[key] = entered;
-                              });
-                              await saveMoodForDate(key, entered);
+                              // PHASE9 Step 6/9: no optimistic setState here
+                              // anymore — saveMoodForDate itself only
+                              // updates moodPercentData/moodEntryIds once
+                              // the backend confirms the save, and shows a
+                              // friendly snackbar (never this success
+                              // dialog) on failure.
+                              final saved = await saveMoodForDate(key, cellDate, entered);
+                              if (!saved) return;
+                              if (!context.mounted) return;
                               showDialog(
                                 context: context,
                                 barrierDismissible: true,

@@ -16,6 +16,8 @@ import 'image_note.dart';
 import 'video_note.dart';
 import 'package:path_provider/path_provider.dart';
 import 'homepage.dart';
+import 'core/network/api_exception.dart';
+import 'data/repositories/auth_repository.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -78,6 +80,23 @@ class _SplashScreenState extends State<SplashScreen> {
     await Future.delayed(
       const Duration(milliseconds: 500),
     ); // for splash effect
+
+    // Phase 7: restore the new FastAPI session (if one is stored) so
+    // AuthRepository/ApiClient have a valid access token ready before any
+    // future FastAPI-backed screen needs one. Deliberately best-effort and
+    // non-blocking for navigation: which screen the splash routes to is
+    // still decided entirely by the existing Firebase-based logic below,
+    // unchanged (see PHASE7_API_INTEGRATION.md, section O, for why the two
+    // are kept independent during this transitional phase — journals,
+    // mood, checklist, etc. are still Firebase-backed and out of scope
+    // here). A failed restore (no session, or a network hiccup) is not
+    // treated as a reason to interrupt the existing flow.
+    try {
+      await AuthRepository.instance.restoreSession();
+    } catch (_) {
+      // Intentionally swallowed — see comment above.
+    }
+
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) {
       Navigator.pushReplacement(
@@ -169,49 +188,61 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   void _login() async {
-    if (_formKey.currentState!.validate()) {
-      String email = _emailController.text.trim();
-      try {
-        // Use centralized user existence check
-        bool exists = await _userExists(email);
-        if (!exists) {
-          showCustomSnackBar(
-            context,
-            'User not found, please register.',
-            icon: Icons.info_outline,
-          );
-          return;
-        }
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: email,
-          password: _passwordController.text.trim(),
-        );
-        // Check if user details exist in Firestore
-        String username = email.split('@')[0];
-        var userDoc = await FirebaseFirestore.instance
-            .collection('users')
-            .doc(username)
-            .get();
-        if (userDoc.exists &&
-            userDoc.data() != null &&
-            userDoc.data()!['name'] != null &&
-            userDoc.data()!['ageGroup'] != null &&
-            userDoc.data()!['phone'] != null &&
-            userDoc.data()!['city'] != null &&
-            userDoc.data()!['country'] != null) {
-          // Details exist, skip EnterDetailsPage
-          Navigator.pushReplacementNamed(context, '/selectFavPerson');
-        } else {
-          // Details missing, go to EnterDetailsPage
-          Navigator.pushReplacementNamed(context, '/enterDetails');
-        }
-      } on FirebaseAuthException catch (e) {
-        showCustomSnackBar(
-          context,
-          e.message ?? 'Login failed',
-          icon: Icons.error_outline,
-        );
-      }
+    if (!_formKey.currentState!.validate()) return;
+
+    final email = _emailController.text.trim();
+    final password = _passwordController.text.trim();
+
+    // Phase 7: the new FastAPI backend is the source of truth for
+    // authentication going forward. `POST /auth/login` gives one identical
+    // 401 for both "unknown email" and "wrong password" (see
+    // backend/app/api/routes/auth.py — deliberate, to avoid letting this
+    // call be used to enumerate registered emails), so the old
+    // Firestore `_userExists` pre-check above is no longer run here: it
+    // would incorrectly block a legacy Firebase-only account that has
+    // never registered with the new backend from ever logging in, and the
+    // backend's own error already tells the user what they need to know.
+    try {
+      await AuthRepository.instance.login(email: email, password: password);
+    } on ApiException catch (e) {
+      showCustomSnackBar(context, e.message, icon: Icons.error_outline);
+      return;
+    }
+
+    // Legacy Firebase sign-in, preserved as-is and run best-effort after
+    // the new backend login succeeds, purely so screens that have not yet
+    // been migrated off Firebase (Home, Journal, Vault, Favorites,
+    // Settings — see PHASE6_INTEGRATION_AUDIT.md) keep working during this
+    // transitional phase. Its own failure is intentionally non-fatal here:
+    // the new backend session (the one this phase is responsible for) has
+    // already succeeded, and swallowing this matches how every other
+    // legacy Firebase call in this file already handles its own errors
+    // independently, per screen. See PHASE7_API_INTEGRATION.md, section P.
+    try {
+      await FirebaseAuth.instance.signInWithEmailAndPassword(email: email, password: password);
+    } catch (e) {
+      debugPrint('Legacy Firebase sign-in failed after backend login succeeded: $e');
+    }
+
+    // Existing navigation logic — UNCHANGED.
+    String username = email.split('@')[0];
+    var userDoc = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(username)
+        .get();
+    if (!mounted) return;
+    if (userDoc.exists &&
+        userDoc.data() != null &&
+        userDoc.data()!['name'] != null &&
+        userDoc.data()!['ageGroup'] != null &&
+        userDoc.data()!['phone'] != null &&
+        userDoc.data()!['city'] != null &&
+        userDoc.data()!['country'] != null) {
+      // Details exist, skip EnterDetailsPage
+      Navigator.pushReplacementNamed(context, '/selectFavPerson');
+    } else {
+      // Details missing, go to EnterDetailsPage
+      Navigator.pushReplacementNamed(context, '/enterDetails');
     }
   }
 
@@ -374,11 +405,14 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                       validator: (value) {
+                        // Matches the backend's LoginRequest validation
+                        // (app/schemas/auth.py: password just needs to be
+                        // non-empty for a login attempt) — not the
+                        // create-time password *policy*, which only
+                        // applies to registration. See register_page.dart
+                        // for that stricter check.
                         if (value == null || value.isEmpty) {
                           return 'Please enter your password';
-                        }
-                        if (value.length < 6) {
-                          return 'Password must be at least 6 characters';
                         }
                         return null;
                       },

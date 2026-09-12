@@ -3,6 +3,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'custom_snackbar.dart';
+import 'core/network/api_exception.dart';
+import 'data/repositories/auth_repository.dart';
 
 class RegisterPage extends StatefulWidget {
   const RegisterPage({super.key});
@@ -34,41 +36,75 @@ class _RegisterPageState extends State<RegisterPage> {
   }
 
   void _register() async {
-    if (_formKey.currentState!.validate()) {
-      String email = _emailController.text.trim();
-      String username = email.split('@')[0];
-      // Use centralized user existence check
-      bool exists = await _userExists(email);
-      if (exists) {
-        showCustomSnackBar(context, 'Already User exists, so use sign in.', icon: Icons.info_outline);
-        return;
-      }
-      try {
-        // Try to register in Firebase Auth
-        UserCredential userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
-          email: email,
-          password: _passwordController.text.trim(),
-        );
-        User? user = userCredential.user;
-        // Only if registration succeeds, write to Firestore
-        await FirebaseFirestore.instance.collection('users').doc(username).set({
-          'uid': user?.uid ?? '',
-          'email': email,
-          'name': _nameController.text.trim(),
-          'provider': 'email',
-          'comfortPerson': {
-            'relation': null,
-            'name': null,
-            'customRelation': null,
-          },
-        });
-        showCustomSnackBar(context, 'Registration successful!', icon: Icons.check_circle_outline);
-        Navigator.pop(context); // Go back to login
-      } on FirebaseAuthException catch (e) {
-        // Show error from Firebase Auth (e.g., email already in use)
-        showCustomSnackBar(context, e.message ?? 'Registration failed', icon: Icons.error_outline);
-      }
+    if (!_formKey.currentState!.validate()) return;
+
+    final email = _emailController.text.trim();
+    final password = _passwordController.text.trim();
+    final name = _nameController.text.trim();
+
+    // Phase 7: the new FastAPI backend is now the source of truth for
+    // account creation, and its own 409 already tells the user exactly
+    // what they need to know (see backend/app/api/routes/auth.py) — so the
+    // old Firestore `_userExists` pre-check no longer runs first here. It
+    // would incorrectly block a fresh backend registration for someone who
+    // already has a legacy Firebase-only account but has never registered
+    // with the new backend, which the old check couldn't tell apart from a
+    // genuine duplicate.
+    try {
+      await AuthRepository.instance.register(email: email, password: password, fullName: name);
+    } on ApiException catch (e) {
+      showCustomSnackBar(context, e.message, icon: Icons.error_outline);
+      return;
     }
+
+    // Legacy Firebase sign-up, preserved as-is and run best-effort after
+    // the new backend registration succeeds, purely so screens that have
+    // not yet been migrated off Firebase (Home, Journal, Vault, Favorites,
+    // Settings) keep working during this transitional phase — see
+    // PHASE7_API_INTEGRATION.md, section P. Falls back to signing in
+    // rather than treating "email already in use" as a failure here: the
+    // new backend account (the one this method is actually responsible
+    // for) has already been created successfully by this point, and a
+    // pre-existing legacy Firebase account for the same email is exactly
+    // the transitional case this fallback exists for.
+    try {
+      UserCredential userCredential;
+      try {
+        userCredential = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+      } on FirebaseAuthException catch (e) {
+        if (e.code == 'email-already-in-use') {
+          userCredential = await FirebaseAuth.instance.signInWithEmailAndPassword(email: email, password: password);
+        } else {
+          rethrow;
+        }
+      }
+      final user = userCredential.user;
+      final username = email.split('@')[0];
+      // merge: true — unlike the original plain `.set(...)`, this must not
+      // clobber an existing legacy document's fields (e.g. onboarding
+      // details already completed) when the fallback above signs in to a
+      // pre-existing account rather than creating a fresh one.
+      await FirebaseFirestore.instance.collection('users').doc(username).set({
+        'uid': user?.uid ?? '',
+        'email': email,
+        'name': name,
+        'provider': 'email',
+        'comfortPerson': {
+          'relation': null,
+          'name': null,
+          'customRelation': null,
+        },
+      }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('Legacy Firebase registration failed after backend registration succeeded: $e');
+    }
+
+    if (!mounted) return;
+    showCustomSnackBar(context, 'Registration successful!', icon: Icons.check_circle_outline);
+    Navigator.pop(context); // Go back to login
   }
 
   @override
@@ -197,11 +233,23 @@ class _RegisterPageState extends State<RegisterPage> {
                         ),
                       ),
                       validator: (value) {
+                        // Matches the backend's RegisterRequest password
+                        // policy exactly (app/schemas/auth.py): at least 8
+                        // characters, at least one letter, at least one
+                        // digit. The old 6-character-only rule would let a
+                        // user submit a password the backend then rejects
+                        // with a 422 anyway.
                         if (value == null || value.isEmpty) {
                           return 'Please enter your password';
                         }
-                        if (value.length < 6) {
-                          return 'Password must be at least 6 characters';
+                        if (value.length < 8) {
+                          return 'Password must be at least 8 characters';
+                        }
+                        if (!RegExp(r'[A-Za-z]').hasMatch(value)) {
+                          return 'Password must contain at least one letter';
+                        }
+                        if (!RegExp(r'[0-9]').hasMatch(value)) {
+                          return 'Password must contain at least one digit';
                         }
                         return null;
                       },

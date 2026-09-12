@@ -6,6 +6,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'custom_snackbar.dart';
 import 'about_us.dart';
+import 'data/repositories/auth_repository.dart';
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key});
 
@@ -121,7 +122,18 @@ class SettingsPage extends StatelessWidget {
                         icon: Icons.notifications,
                         label: 'Logout',
                         onTap: () async {
+                          // Phase 7: revokes the new backend session
+                          // (POST /auth/logout — best-effort, see
+                          // AuthRepository.logout) and clears the locally
+                          // stored access/refresh tokens first, then signs
+                          // out of Firebase exactly as before, so both
+                          // authentication systems this transitional phase
+                          // maintains in parallel (see
+                          // PHASE7_API_INTEGRATION.md, section P) end up
+                          // logged out together.
+                          await AuthRepository.instance.logout();
                           await FirebaseAuth.instance.signOut();
+                          if (!context.mounted) return;
                           Navigator.pushReplacementNamed(context, '/');
                         },
                       ),

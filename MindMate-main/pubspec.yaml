@@ -45,7 +45,15 @@ dependencies:
   audioplayers: ^6.5.0
   path_provider: ^2.1.2
   uuid: ^4.2.2
-  file_picker: any
+  # Pinned below 11.0.0: file_picker 11.x is a BREAKING release that removed
+  # the FilePicker.platform instance getter in favor of static methods
+  # (FilePicker.pickFiles(...)). vault.dart / viewall_images.dart /
+  # viewall_videos.dart all call FilePicker.platform.pickFiles(...), so an
+  # unconstrained "any" resolves to 11.x and fails to compile. 10.3.10 is the
+  # newest published release before 11.0.0 and still exposes the .platform
+  # API used here (confirmed via `pub get`; pub.dev lists no 10.4.x-10.x.x
+  # releases between 10.3.10 and 11.0.0).
+  file_picker: ^10.3.10
   hive: ^2.2.3
   hive_flutter: ^1.1.0
   permission_handler: ^11.3.1
@@ -55,6 +63,18 @@ dependencies:
   cached_network_image: ^3.3.0
   uni_links: ^0.5.1
   share_plus: ^7.2.1
+  # --- Phase 7: FastAPI backend integration (authentication) ---
+  # Dio: chosen over the bare `http` package specifically for its
+  # interceptor API, which is what makes centralized Bearer-token
+  # injection and automatic refresh-on-401 (see
+  # lib/core/network/api_client.dart) possible without repeating that
+  # logic at every call site. See PHASE7_API_INTEGRATION.md.
+  dio: ^5.7.0
+  # flutter_secure_storage: the project's only pre-existing local-storage
+  # options (Hive, shared_preferences) are plaintext-on-disk, which is
+  # not acceptable for a long-lived refresh token. Keychain on iOS,
+  # EncryptedSharedPreferences/Keystore on Android.
+  flutter_secure_storage: ^9.2.2
 
 
 dev_dependencies:
@@ -63,6 +83,9 @@ dev_dependencies:
   flutter_launcher_icons: ^0.14.4
   build_runner: ^2.4.8
   hive_generator: ^2.0.1
+  # mocktail: no code generation, dev-only — used to mock ApiClient/http
+  # responses in the new auth tests (see test/data, test/core/network).
+  mocktail: ^1.0.4
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

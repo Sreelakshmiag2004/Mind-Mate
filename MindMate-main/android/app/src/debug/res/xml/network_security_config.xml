@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 7 — DEBUG BUILDS ONLY (this file lives under src/debug/, so Gradle's
+  manifest/resource merger never includes it in a profile or release build;
+  those keep Android's default HTTPS-only policy, as they must).
+
+  Permits plain-HTTP traffic to the FastAPI backend's local development
+  addresses ONLY — see API_CONFIGURATION.md. The backend's local dev server
+  has no TLS certificate (setting one up for a throwaway local server isn't
+  worth the trouble — see backend/README.md), so without this, every
+  authenticated request from a debug build to a local backend would be
+  silently blocked by Android's default cleartext-traffic policy.
+
+  Add your own LAN IP here if you're testing against a physical device on
+  the same Wi-Fi network — do not widen this to allow cleartext for every
+  domain, and never apply this pattern outside src/debug/.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>
