@@ -11,6 +11,7 @@ from app.models.auth_session import AuthSession
 from app.models.journal import JournalEntry
 from app.models.mood import MoodEntry
 from app.models.checklist import ChecklistItem, ChecklistCompletion
+from app.models.scheduler import SchedulerEntry
 from app.models.shoutout import Shoutout
 from app.models.media_asset import MediaAsset
 from app.models.relationship import Relationship
@@ -27,6 +28,7 @@ __all__ = [
     "MoodEntry",
     "ChecklistItem",
     "ChecklistCompletion",
+    "SchedulerEntry",
     "Shoutout",
     "MediaAsset",
     "Relationship",

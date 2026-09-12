@@ -1,5 +1,5 @@
 /// Phase 7 added `/auth/*` and `/health`; Phase 8 added `/journals`; Phase 9
-/// added `/moods`; Phase 10 adds `/checklists`.
+/// added `/moods`; Phase 10 added `/checklists`; Phase 11B adds `/scheduler`.
 ///
 /// Still deliberately limited to the features actually wired up so far —
 /// every other backend route (shoutouts, media, relationships, stress,
@@ -54,4 +54,10 @@ class ApiEndpoints {
   /// address a whole day by its date, never by a per-completion id — see
   /// PHASE10 audit report, Section 2.
   static String checklistByDate(String entryDate) => '/checklists/$entryDate';
+
+  /// `GET` (this user's scheduled rows for the date) and `PUT` (whole-day
+  /// replace) both address a single date, never a per-row id — same shape
+  /// as [checklistByDate]. See PHASE11B and `backend/app/api/routes/schedulers.py`.
+  static const String scheduler = '/scheduler';
+  static String schedulerByDate(String entryDate) => '$scheduler/$entryDate';
 }

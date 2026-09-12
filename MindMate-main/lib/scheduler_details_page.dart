@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:hive/hive.dart';
-import 'package:intl/intl.dart';
+
+import 'core/network/api_exception.dart';
+import 'custom_snackbar.dart';
+import 'data/models/scheduler/scheduler_model.dart';
+import 'data/repositories/scheduler_repository.dart';
 
 class SchedulerDetailsPage extends StatefulWidget {
   final List<Map<String, String>>? initialSchedule;
@@ -14,11 +17,16 @@ class SchedulerDetailsPage extends StatefulWidget {
 class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
   List<Map<String, String>> schedule = [];
 
+  /// True while a save is in flight — disables the Save button and swaps
+  /// its label for a spinner so a slow/duplicate tap can't fire a second
+  /// overlapping PUT (PHASE11B).
+  bool _isSaving = false;
+
   @override
   void initState() {
     super.initState();
     schedule = widget.initialSchedule != null
-        ? List<Map<String, String>>.from(widget.initialSchedule!)
+        ? widget.initialSchedule!.map((row) => Map<String, String>.from(row)).toList()
         : List.generate(8, (_) => {'time': '', 'desc': ''});
   }
 
@@ -34,21 +42,66 @@ class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
     });
   }
 
-  void _save() async {
-    // Save to Hive using today's date as key
-    final box = Hive.box('schedulerBox');
-    final todayKey = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    // Convert schedule (List<Map<String, String>>) to Map<String, String>
-    Map<String, String> scheduleMap = {};
-    for (final row in schedule) {
-      final time = row['time'] ?? '';
-      final desc = row['desc'] ?? '';
-      if (time.isNotEmpty) {
-        scheduleMap[time] = desc;
-      }
+  /// Saves the full day via `PUT /scheduler/{today}` (PHASE11B — replacing
+  /// the old direct-to-Hive write). The UI is only updated, and the page
+  /// only popped back to HomePage, once the backend confirms the save —
+  /// never optimistically, and never on failure. On failure the user stays
+  /// on this page with a clear, friendly error and nothing pretends to
+  /// have succeeded.
+  Future<void> _save() async {
+    // PHASE11B: duplicate-time detection and the blank-time-row/blank-
+    // description rules live in the pure, unit-tested `buildSchedulerRows`
+    // (scheduler_model.dart) — this screen only decides what to show the
+    // user when it refuses. `null` means two or more rows share a time;
+    // nothing is sent to the backend in that case.
+    final rows = buildSchedulerRows(schedule);
+    if (rows == null) {
+      showCustomSnackBar(
+        context,
+        'Two rows have the same time. Please use a different time for each row before saving.',
+        icon: Icons.error_outline,
+      );
+      return;
     }
-    await box.put(todayKey, scheduleMap);
-    Navigator.pop(context, schedule);
+
+    setState(() => _isSaving = true);
+    try {
+      final saved = await SchedulerRepository.instance.replaceDay(DateTime.now(), rows);
+      if (!mounted) return;
+      final savedSchedule = saved.items
+          .map((item) => {'time': colonTimeToDot(item.scheduledTime), 'desc': item.description ?? ''})
+          .toList();
+      setState(() {
+        schedule = savedSchedule;
+        _isSaving = false;
+      });
+      Navigator.pop(context, savedSchedule);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      showCustomSnackBar(context, _friendlySchedulerError(e), icon: Icons.error_outline);
+    }
+  }
+
+  /// Maps a Scheduler [ApiException] to a short, clean, user-facing
+  /// message — same approach as `homepage.dart`'s `_friendlyChecklistError`/
+  /// `_friendlyMoodError`. Every status this doesn't specifically name
+  /// falls back to [ApiException.message], already documented as safe to
+  /// show directly.
+  String _friendlySchedulerError(ApiException e) {
+    if (e is ValidationException) {
+      return 'That schedule could not be saved — please check the times entered and try again.';
+    }
+    if (e is ConflictException) {
+      return 'That schedule could not be saved because of a conflicting entry. Please try again.';
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong saving your schedule. Please try again.';
   }
 
   @override
@@ -106,7 +159,7 @@ class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
                             color: const Color(0xFFFFE0E0),
                             child: InkWell(
                               borderRadius: BorderRadius.circular(8),
-                              onTap: widget.isViewMode ? null : () async {
+                              onTap: widget.isViewMode || _isSaving ? null : () async {
                                 final time = await showTimePicker(
                                   context: context,
                                   initialTime: TimeOfDay(
@@ -175,7 +228,7 @@ class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
                         ),
                         IconButton(
                           icon: const Icon(Icons.remove_circle, color: Color(0xFFFFBFAE)),
-                          onPressed: widget.isViewMode || schedule.length <= 1 ? null : () => _removeRow(i),
+                          onPressed: widget.isViewMode || _isSaving || schedule.length <= 1 ? null : () => _removeRow(i),
                         ),
                       ],
                     );
@@ -187,7 +240,7 @@ class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
                 children: [
                   IconButton(
                     icon: const Icon(Icons.add_circle, color: Color(0xFFFFBFAE)),
-                    onPressed: widget.isViewMode ? null : _addRow,
+                    onPressed: widget.isViewMode || _isSaving ? null : _addRow,
                   ),
                 ],
               ),
@@ -204,10 +257,16 @@ class _SchedulerDetailsPageState extends State<SchedulerDetailsPage> {
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(32)),
             minimumSize: const Size(180, 48),
           ),
-          onPressed: _save,
-          child: const Text('Save', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+          onPressed: (widget.isViewMode || _isSaving) ? null : _save,
+          child: _isSaving
+              ? const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white),
+                )
+              : const Text('Save', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
         ),
       ),
     );
   }
-} 
+}

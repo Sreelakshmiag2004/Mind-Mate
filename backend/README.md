@@ -473,6 +473,61 @@ curl -X PATCH http://localhost:8000/checklists/2025-06-01 -H "Authorization: Bea
 }
 ```
 
+### Scheduler
+
+Added in Phase 11A — the existing app previously had no backend for this
+feature at all; it stored an unscoped, date-only-keyed local Hive box
+directly on-device, with a confirmed silent-overwrite bug when two rows
+shared a time (see the Flutter migration's PHASE11 audit report). This
+API is deliberately date-scoped, not per-entry CRUD, mirroring Checklist's
+shape rather than Journal's/Mood's — see "Design decisions" below.
+
+| Method | Route | Auth | Purpose |
+|---|---|:---:|---|
+| GET | `/scheduler/{entry_date}` | Yes | Your scheduled rows for that date, ordered by time (empty `items` if nothing is scheduled) |
+| PUT | `/scheduler/{entry_date}` | Yes | Replace your ENTIRE schedule for that date with `rows` in one call |
+
+No `DELETE` — a `PUT` that omits a previously-saved time already deletes
+it as part of the whole-day replace, matching the existing app's
+edit-freely-then-save-once flow. `rows: []` clears the day.
+
+`scheduled_time` must be exactly `"HH:MM"`, 24-hour, zero-padded (`"09:00"`,
+`"14:30"`, `"23:45"`) — a malformed or out-of-range time is rejected with
+`422`, as is a `PUT` whose `rows` contain the same `scheduled_time` twice
+(see "Design decisions" for why that check lives in the service layer, and
+why the database also enforces `UNIQUE(user_id, entry_date,
+scheduled_time)` as a final backstop against a concurrent-request race).
+There is intentionally no "yesterday fallback" here: if a client wants
+that display behavior, it fetches yesterday's date itself when today's is
+empty — this API only ever answers "what's on this exact date."
+
+**Example — save a day's schedule:**
+```bash
+curl -X PUT http://localhost:8000/scheduler/2025-06-01 -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"rows": [{"scheduled_time": "09:00", "description": "Gym"}, {"scheduled_time": "14:30", "description": "Study"}]}'
+```
+```json
+{
+  "entry_date": "2025-06-01",
+  "items": [
+    {"id": "b1c2d3e4-...", "entry_date": "2025-06-01", "scheduled_time": "09:00", "description": "Gym", "created_at": "...", "updated_at": "..."},
+    {"id": "c2d3e4f5-...", "entry_date": "2025-06-01", "scheduled_time": "14:30", "description": "Study", "created_at": "...", "updated_at": "..."}
+  ]
+}
+```
+
+**Example — a self-contradictory request is rejected before anything is written:**
+```bash
+curl -X PUT http://localhost:8000/scheduler/2025-06-01 -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"rows": [{"scheduled_time": "09:00", "description": "Gym"}, {"scheduled_time": "09:00", "description": "Study"}]}'
+```
+```json
+{"detail": "scheduled_time '09:00' appears more than once in the same request"}
+```
+`422 Unprocessable Content` — the prior day's schedule, if any, is left untouched.
+
 ### Shoutouts
 
 **Shoutout data model — what the audit found, and why the schema looks like it does.**
@@ -1321,6 +1376,47 @@ reflections for the same user/week" behavior, verified by
   check is provider-independent on purpose: it holds even against a
   future provider implementation that doesn't offer schema-constrained
   generation at all.
+
+**Phase 11A additions to this list** (Scheduler — not part of the
+original Phase 1-5 plan; added later, following the same Flutter-migration
+audit process as journals/moods/checklists):
+
+* **Scheduler had no backend at all before this phase.** Confirmed from
+  source: the existing app stores schedule data only in a local Hive box
+  (`schedulerBox`), keyed by date alone with no per-user scoping, written
+  independently by two different Flutter files with no shared code between
+  them. This is the first backend-authoritative version of that data.
+* **`scheduled_time` is a plain `"HH:MM"` string column, not a SQL
+  `Time`/`DateTime`.** The app has no concept of seconds or
+  timezone-aware scheduling — it's a 24-hour wall-clock label a user picks
+  via a time picker on a specific calendar date, nothing more; a real
+  `Time` type would imply precision/comparison semantics this feature has
+  never had.
+* **The old app's "today's schedule falls back to yesterday's" display
+  behavior is explicitly NOT implemented here.** Confirmed a deliberate
+  product decision (not an oversight): the backend stays a simple,
+  date-specific API — `GET /scheduler/{entry_date}` only ever answers
+  "what's on this exact date." Any "show yesterday's if today is empty"
+  behavior is the Flutter client's responsibility (a second `GET` call),
+  not something this API implements or is aware of.
+* **The API is a whole-day `GET`/`PUT` pair, not per-row CRUD.** The
+  existing Flutter UI only ever edits a full day at once (add/remove rows
+  freely, then one "Save"), never a single row in isolation — a `PUT`
+  that replaces the entire day's row set in one call matches that
+  exactly, and needs no separate `DELETE` (a row's absence from `rows` is
+  how it's removed).
+* **Duplicate-time rejection is deliberately a service-layer check
+  (`DuplicateScheduleTimeError`, mapped to 422), not a Pydantic
+  validator**, because it has to inspect the whole `rows` list as a set,
+  not one field in isolation — no existing schema in this codebase has a
+  precedent for that shape of cross-item check. `UNIQUE(user_id,
+  entry_date, scheduled_time)` at the database level is the independent,
+  final backstop against the same rule being violated by a genuine
+  concurrent-request race (mapped to 409 via the pre-existing
+  `ConflictError`, distinct from a single self-contradictory request's
+  422) — this directly fixes a real, confirmed bug in the old app, where
+  two rows sharing a time silently overwrote one another instead of being
+  rejected.
 
 ## What Phase 5 deliberately does not include
 

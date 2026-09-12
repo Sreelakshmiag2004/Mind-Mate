@@ -132,3 +132,17 @@ class AIProviderResponseError(AIProviderError):
     never store this response as a valid reflection — see
     app/services/reflection_service.py.
     """
+
+
+# --- Scheduler errors (Phase 11A) ---
+
+
+class DuplicateScheduleTimeError(DomainError):
+    """
+    Raised when a PUT /scheduler/{entry_date} request contains the same
+    scheduled_time in two different rows — see
+    app/services/scheduler_service.py. Maps to 422 (the request itself is
+    self-contradictory), distinct from ConflictError's 409 (a uniqueness
+    rule violated against already-persisted data, or a concurrent-request
+    race — see that module's docstring for how both layers cooperate).
+    """

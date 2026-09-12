@@ -8,18 +8,19 @@ import 'favorite_page.dart';
 import 'journal_page.dart';
 import 'vault_password.dart';
 import 'settings_page.dart';
-import 'package:hive/hive.dart';
 // PHASE9: Mood data now comes from the FastAPI backend via MoodRepository.
-// cloud_firestore/firebase_auth stay imported above — Checklist and
-// Scheduler (in this same file/State) still use them (Checklist via
-// Firestore, Scheduler via Hive); only Mood's own calls have moved off
-// Firestore. See PHASE9 audit report, Section J.
+// PHASE11B: Scheduler data now comes from the FastAPI backend via
+// SchedulerRepository too — it no longer uses Hive (schedulerBox stays
+// registered in main.dart only because other, unrelated features still use
+// Hive; Scheduler itself no longer reads/writes it). See PHASE11B report.
 import 'custom_snackbar.dart';
 import 'core/network/api_exception.dart';
 import 'data/models/journal/journal_model.dart' show formatDateOnly;
 import 'data/models/mood/mood_model.dart';
+import 'data/models/scheduler/scheduler_model.dart';
 import 'data/repositories/checklist_repository.dart';
 import 'data/repositories/mood_repository.dart';
+import 'data/repositories/scheduler_repository.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({Key? key}) : super(key: key);
@@ -269,33 +270,73 @@ class _HomePageState extends State<HomePage> {
     return 'Something went wrong updating your checklist. Please try again.';
   }
 
+  /// Loads today's schedule via `GET /scheduler/{today}`
+  /// (`SchedulerRepository`, PHASE11B — replacing the old direct
+  /// `schedulerBox` read). Preserves the pre-existing "fall back to
+  /// yesterday" display behavior exactly (PHASE11A product decision 1: the
+  /// fallback stays entirely client-side, never implemented on the
+  /// backend):
+  ///
+  ///   A. Request today's schedule.
+  ///   B. If today's response has no items, request yesterday's.
+  ///   C. If yesterday has items, display yesterday's schedule.
+  ///   D. If both are empty, display an empty schedule.
+  ///
+  /// On failure, whatever was already showing is left untouched — only a
+  /// friendly snackbar is shown, matching `loadChecklist`'s/
+  /// `_loadMoodsForVisibleRange`'s existing failure handling.
   Future<void> loadScheduler() async {
-    final box = Hive.box('schedulerBox');
-    final todaySchedule = box.get(todayKey);
-    if (todaySchedule != null) {
-      setState(() {
-        schedule = Map<String, String>.from(todaySchedule);
-        times = schedule.keys.toList();
-      });
-    } else {
-      // Try to load yesterday's scheduler if today is empty
-      final yestSchedule = box.get(yesterdayKey);
-      if (yestSchedule != null) {
-        setState(() {
-          schedule = Map<String, String>.from(yestSchedule);
-          times = schedule.keys.toList();
-        });
+    try {
+      final today = await SchedulerRepository.instance.getDay(DateTime.now());
+      if (today.items.isNotEmpty) {
+        _applySchedulerDay(today);
+        return;
+      }
+      final yesterday = await SchedulerRepository.instance.getDay(
+        DateTime.now().subtract(const Duration(days: 1)),
+      );
+      if (yesterday.items.isNotEmpty) {
+        _applySchedulerDay(yesterday);
       } else {
+        if (!mounted) return;
         setState(() {
           schedule = {};
           times = [];
         });
       }
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlySchedulerError(e));
     }
   }
-  Future<void> saveScheduler() async {
-    final box = Hive.box('schedulerBox');
-    await box.put(todayKey, schedule);
+
+  /// Applies a [SchedulerDay] fetched from the backend into this screen's
+  /// existing `times`/`schedule` display state (a `List<String>` of
+  /// `"H.MM"`/`"HH.MM"` time labels and a matching `time -> description`
+  /// map) — the same shape `loadScheduler` always populated, just now
+  /// sourced from the backend instead of Hive. [colonTimeToDot] does the
+  /// only time-format conversion this file needs (PHASE11B: conversion
+  /// happens only at the Scheduler boundary).
+  void _applySchedulerDay(SchedulerDay day) {
+    if (!mounted) return;
+    setState(() {
+      schedule = {
+        for (final item in day.items) colonTimeToDot(item.scheduledTime): item.description ?? '',
+      };
+      times = schedule.keys.toList();
+    });
+  }
+
+  /// Maps a Scheduler [ApiException] to a short, clean, user-facing
+  /// message — same approach as [_friendlyChecklistError]/[_friendlyMoodError].
+  String _friendlySchedulerError(ApiException e) {
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong loading your schedule. Please try again.';
   }
 
   // PHASE9: Mood reads/writes now go through MoodRepository (FastAPI)
@@ -409,11 +450,6 @@ class _HomePageState extends State<HomePage> {
       return 'Your session has expired. Please log in again.';
     }
     return 'Something went wrong saving your mood. Please try again.';
-  }
-
-  Future<void> saveSchedulerForDate(String dateKey, Map<String, String> schedule) async {
-    final box = Hive.box('schedulerBox');
-    await box.put(dateKey, schedule);
   }
 
   // --- Reset at Midnight ---
@@ -711,7 +747,7 @@ class _HomePageState extends State<HomePage> {
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                         ),
                         onPressed: () async {
-                          final result = await Navigator.push(
+                          await Navigator.push(
                             context,
                             MaterialPageRoute(
                               builder: (context) => SchedulerDetailsPage(
@@ -719,7 +755,11 @@ class _HomePageState extends State<HomePage> {
                               ),
                             ),
                           );
-                          // Always reload from Hive after returning from the details page
+                          // PHASE11B: SchedulerDetailsPage always saves for
+                          // today via the backend before popping (or stays
+                          // open on failure — see its own _save), so
+                          // reloading today's schedule here afterward is
+                          // always safe/authoritative, same as before.
                           await loadScheduler();
                         },
                         child: const Text('Edit'),

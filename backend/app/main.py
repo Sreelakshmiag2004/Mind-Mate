@@ -1,7 +1,19 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, checklists, health, journals, media, moods, reflections, relationships, shoutouts, stress
+from app.api.routes import (
+    auth,
+    checklists,
+    health,
+    journals,
+    media,
+    moods,
+    reflections,
+    relationships,
+    schedulers,
+    shoutouts,
+    stress,
+)
 from app.core.config import settings
 
 app = FastAPI(
@@ -35,3 +47,4 @@ app.include_router(media.router)
 app.include_router(relationships.router)
 app.include_router(stress.router)
 app.include_router(reflections.router)
+app.include_router(schedulers.router)

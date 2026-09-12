@@ -70,6 +70,15 @@ class ApiClient {
   Future<Map<String, dynamic>?> patch(String path, {Object? data, bool requiresAuth = true}) =>
       _send('PATCH', path, data: data, requiresAuth: requiresAuth);
 
+  /// PHASE11B: added for Scheduler's whole-day `PUT /scheduler/{entry_date}`
+  /// replace — the first caller in the app that needs a `PUT` rather than a
+  /// `PATCH`. Goes through the same [_send] every other verb uses, so it
+  /// gets identical Bearer-header attachment, 401-refresh-retry, and
+  /// [ApiException] mapping; purely additive, no existing caller is
+  /// affected.
+  Future<Map<String, dynamic>?> put(String path, {Object? data, bool requiresAuth = true}) =>
+      _send('PUT', path, data: data, requiresAuth: requiresAuth);
+
   Future<Map<String, dynamic>?> delete(String path, {Object? data, bool requiresAuth = true}) =>
       _send('DELETE', path, data: data, requiresAuth: requiresAuth);
 
