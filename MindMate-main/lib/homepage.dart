@@ -18,6 +18,7 @@ import 'custom_snackbar.dart';
 import 'core/network/api_exception.dart';
 import 'data/models/journal/journal_model.dart' show formatDateOnly;
 import 'data/models/mood/mood_model.dart';
+import 'data/repositories/checklist_repository.dart';
 import 'data/repositories/mood_repository.dart';
 
 class HomePage extends StatefulWidget {
@@ -29,6 +30,11 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   // Checklist state
+  // PHASE10: these 5 hard-coded labels are now only the initial/default UI
+  // state shown before the backend catalog loads — see loadChecklist().
+  // The backend (GET /checklists/items) is authoritative for labels, order,
+  // and id going forward; this default exists purely so the section isn't
+  // blank for the one frame before that first network call resolves.
   List<bool> checklist = [false, false, false, false, false];
   List<String> checklistItems = [
     'Drank enough water 💧',
@@ -37,6 +43,28 @@ class _HomePageState extends State<HomePage> {
     'Got some fresh air and sunlight 🏝️',
     'Exercised well 🧘‍♂️',
   ];
+
+  /// PHASE10: the backend UUID for each entry in [checklist]/[checklistItems],
+  /// same index — this is how a checkbox's array position maps to "which
+  /// item is this" for the backend, since the old Firestore array had no
+  /// concept of item identity beyond position. Empty until [loadChecklist]'s
+  /// catalog fetch succeeds.
+  List<String> checklistItemIds = [];
+
+  /// Set once the backend catalog has been fetched successfully, so
+  /// `loadChecklist()` doesn't re-fetch `GET /checklists/items` on every
+  /// call within the same `HomePage` session (PHASE10 Step 4) — only the
+  /// per-date completion state (`GET /checklists/{date}`) needs refreshing.
+  bool _checklistCatalogLoaded = false;
+
+  /// Per-checkbox-index request counter guarding against an older, slower
+  /// `PATCH /checklists/{date}` response overwriting a newer one for the
+  /// same item (PHASE10 Step 8 — e.g. a user double-tapping a checkbox
+  /// quickly). Each toggle increments its index's counter before awaiting
+  /// the network call; the response is only applied if that index's
+  /// counter hasn't moved on again since. Deliberately just a `Map<int,
+  /// int>` rather than a new state-management dependency.
+  final Map<int, int> _checklistToggleSeq = {};
 
   // Scheduler state
   List<String> times = ['9.00', '10.00', '11.00'];
@@ -129,21 +157,116 @@ class _HomePageState extends State<HomePage> {
   String get yesterdayKey => DateFormat('yyyy-MM-dd').format(DateTime.now().subtract(const Duration(days: 1)));
 
   // --- Firebase Load/Save Functions ---
+  // PHASE10: Checklist reads/writes now go through ChecklistRepository
+  // (FastAPI) instead of Firestore. See PHASE10 audit report, Section D,
+  // for the exact two Firestore call sites this replaced.
+
+  /// Loads the backend catalog (once per `HomePage` session — see
+  /// [_checklistCatalogLoaded]) and today's completion state, replacing the
+  /// old single Firestore doc read. The catalog is authoritative for
+  /// [checklistItems]/[checklistItemIds]/their order; [checklist] keeps its
+  /// existing default (`[false, false, false, false, false]`) until both
+  /// calls resolve, preserving the pre-migration "just shows the default
+  /// until data arrives" loading behavior (PHASE10 Step 6) — no new spinner.
+  ///
+  /// On failure, whatever was already showing (the compile-time default, or
+  /// a previously successful load) is left untouched — only a friendly
+  /// snackbar is shown, so a transient network error can't blank the
+  /// section or crash the Home screen (PHASE10 Step 12).
   Future<void> loadChecklist() async {
-    final doc = await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('checklist').doc(todayKey).get();
-    if (doc.exists) {
+    try {
+      if (!_checklistCatalogLoaded) {
+        final catalog = await ChecklistRepository.instance.getCatalog();
+        if (!mounted) return;
+        final sortedCatalog = [...catalog]..sort((a, b) => a.sortOrder.compareTo(b.sortOrder));
+        setState(() {
+          checklistItems = sortedCatalog.map((item) => item.label).toList();
+          checklistItemIds = sortedCatalog.map((item) => item.id).toList();
+          if (checklist.length != sortedCatalog.length) {
+            checklist = List<bool>.filled(sortedCatalog.length, false);
+          }
+          _checklistCatalogLoaded = true;
+        });
+      }
+
+      final day = await ChecklistRepository.instance.getDay(DateTime.now());
+      if (!mounted) return;
+      final stateByItemId = {for (final state in day.items) state.itemId: state};
       setState(() {
-        checklist = List<bool>.from(doc['items']);
+        // Matched by item id, not by list position, so a mismatch between
+        // two independently-fetched lists can never silently mis-align a
+        // checkbox with the wrong item (PHASE10 Step 5's "UI index ->
+        // backend item UUID must be deterministic and correctly mapped").
+        for (var i = 0; i < checklistItemIds.length; i++) {
+          checklist[i] = stateByItemId[checklistItemIds[i]]?.completed ?? false;
+        }
       });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyChecklistError(e));
     }
   }
-  Future<void> saveChecklist() async {
-    await FirebaseFirestore.instance
-        .collection('users').doc(userId)
-        .collection('checklist').doc(todayKey)
-        .set({'items': checklist});
+
+  /// Toggles the checklist item at [index] to [newValue] via
+  /// `ChecklistRepository.toggleItem`, replacing the old
+  /// `saveChecklist()`'s fire-and-forget, whole-array Firestore write.
+  ///
+  /// PHASE10 Step 7: no optimistic update — [checklist] is only changed
+  /// once the backend confirms the save (to whatever value it actually
+  /// stored, from the response, rather than blindly assuming [newValue]
+  /// took effect), and is left at its prior value on failure, alongside a
+  /// friendly snackbar. Never a fire-and-forget call, and never a success
+  /// implied that didn't happen.
+  ///
+  /// PHASE10 Step 8: [_checklistToggleSeq] guards against an older, slower
+  /// response overwriting a newer one for the same checkbox — the response
+  /// (success or failure) is only applied if no newer toggle for this same
+  /// [index] has started since this call began.
+  Future<void> _toggleChecklistItem(int index, bool newValue) async {
+    if (index < 0 || index >= checklistItemIds.length) return;
+    final itemId = checklistItemIds[index];
+    final previousValue = checklist[index];
+    final requestSeq = (_checklistToggleSeq[index] ?? 0) + 1;
+    _checklistToggleSeq[index] = requestSeq;
+
+    try {
+      final day = await ChecklistRepository.instance.toggleItem(DateTime.now(), itemId, newValue);
+      if (!mounted) return;
+      if (_checklistToggleSeq[index] != requestSeq) return; // superseded by a newer toggle
+      setState(() {
+        final state = {for (final s in day.items) s.itemId: s}[itemId];
+        checklist[index] = state?.completed ?? newValue;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      if (_checklistToggleSeq[index] != requestSeq) return; // a newer toggle supersedes this failure too
+      setState(() {
+        checklist[index] = previousValue;
+      });
+      showCustomSnackBar(context, _friendlyChecklistError(e));
+    }
+  }
+
+  /// Maps a Checklist [ApiException] to a short, clean, user-facing
+  /// message — same approach as `journal_page.dart`'s
+  /// `_friendlyJournalError` / `homepage.dart`'s own `_friendlyMoodError`.
+  /// Every status this doesn't specifically name falls back to
+  /// [ApiException.message], already documented as safe to show directly —
+  /// never a raw exception string or stack trace.
+  String _friendlyChecklistError(ApiException e) {
+    if (e is NotFoundException) {
+      return 'That checklist item could not be found.';
+    }
+    if (e is ValidationException) {
+      return 'That checklist update could not be saved. Please try again.';
+    }
+    if (e is NetworkException) {
+      return "Couldn't reach the server. Check your connection and try again.";
+    }
+    if (e is UnauthorizedException) {
+      return 'Your session has expired. Please log in again.';
+    }
+    return 'Something went wrong updating your checklist. Please try again.';
   }
 
   Future<void> loadScheduler() async {
@@ -442,10 +565,12 @@ class _HomePageState extends State<HomePage> {
                         child: CheckboxListTile(
                           value: checklist[i],
                           onChanged: (val) {
-                            setState(() {
-                              checklist[i] = val ?? false;
-                            });
-                            saveChecklist();
+                            // PHASE10 Step 7: no optimistic setState here —
+                            // _toggleChecklistItem itself only updates
+                            // `checklist[i]` once the backend confirms the
+                            // save, and restores the prior value with a
+                            // friendly snackbar on failure.
+                            _toggleChecklistItem(i, val ?? false);
                           },
                           title: Text(
                             checklistItems[i],

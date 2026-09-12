@@ -1,9 +1,9 @@
 /// Phase 7 added `/auth/*` and `/health`; Phase 8 added `/journals`; Phase 9
-/// adds `/moods`.
+/// added `/moods`; Phase 10 adds `/checklists`.
 ///
 /// Still deliberately limited to the features actually wired up so far —
-/// every other backend route (checklists, shoutouts, media, relationships,
-/// stress, reflections) is real and working server-side (see
+/// every other backend route (shoutouts, media, relationships, stress,
+/// reflections) is real and working server-side (see
 /// PHASE6_INTEGRATION_AUDIT.md), but wiring them up is explicitly out of
 /// scope until the phase that migrates each one. Do not add constants for
 /// them here yet; add them in the phase that actually integrates each
@@ -41,4 +41,17 @@ class ApiEndpoints {
   /// `DELETE /moods/{id}` on the backend (see PHASE9 audit report, Section
   /// E) so, unlike `journalById`, this is never used for a delete call.
   static String moodById(String moodId) => '$moods/$moodId';
+
+  /// The fixed, global task catalog — `GET` only, no `POST`/`DELETE` (the
+  /// app has no way to add/remove checklist items; see
+  /// `backend/app/api/routes/checklists.py`). Returns a bare JSON array,
+  /// not a `Page[T]` object, so this goes through `ApiClient.getList`, not
+  /// `ApiClient.get` — see that method's doc.
+  static const String checklistItems = '/checklists/items';
+
+  /// `GET` (this user's completion state for every catalog item on this
+  /// date) and `PATCH` (toggle one or more items for this date) both
+  /// address a whole day by its date, never by a per-completion id — see
+  /// PHASE10 audit report, Section 2.
+  static String checklistByDate(String entryDate) => '/checklists/$entryDate';
 }

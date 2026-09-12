@@ -73,6 +73,36 @@ class ApiClient {
   Future<Map<String, dynamic>?> delete(String path, {Object? data, bool requiresAuth = true}) =>
       _send('DELETE', path, data: data, requiresAuth: requiresAuth);
 
+  /// Like [get], but for the handful of endpoints whose response body is a
+  /// bare JSON array rather than an object — currently only
+  /// `GET /checklists/items` (`list[ChecklistItemRead]`; every other
+  /// list-shaped endpoint this app calls, e.g. `/journals`/`/moods`, is
+  /// `Page[T]`-wrapped and goes through [get] instead). [_send]/[get]
+  /// deliberately reject a bare-array body (see [_send]'s own comment on
+  /// that), so this is a separate, minimal, purely additive method rather
+  /// than a behavior change to [_send] — every existing caller of
+  /// [get]/[post]/[patch]/[delete] is unaffected. Still goes through
+  /// `_dio`, so it gets the same Bearer-header attachment and transparent
+  /// 401-refresh-retry as every other call (that logic lives in the
+  /// interceptors registered on `_dio` itself, not in [_send]).
+  Future<List<dynamic>?> getList(String path, {Map<String, dynamic>? queryParameters, bool requiresAuth = true}) async {
+    late final Response<dynamic> response;
+    try {
+      response = await _dio.request<dynamic>(
+        path,
+        queryParameters: queryParameters,
+        options: Options(method: 'GET', extra: {'requiresAuth': requiresAuth}),
+      );
+    } on DioException catch (error) {
+      throw ApiException.fromDioException(error);
+    }
+
+    if (response.data == null) return null;
+    if (response.data is String && (response.data as String).isEmpty) return null;
+    if (response.data is List<dynamic>) return response.data as List<dynamic>;
+    throw UnknownApiException('Unexpected response shape from the server.', statusCode: response.statusCode);
+  }
+
   Future<Map<String, dynamic>?> _send(
     String method,
     String path, {
