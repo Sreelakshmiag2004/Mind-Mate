@@ -20,6 +20,9 @@ import 'core/network/api_exception.dart';
 import 'data/models/media/media_asset_model.dart';
 import 'data/repositories/media_repository.dart';
 import 'custom_snackbar.dart';
+// PHASE14I-F: suppresses a migrated legacy Hive image from this page's own
+// merged list — see legacy_media_reconciliation.dart's doc.
+import 'data/services/legacy_media_reconciliation.dart';
 
 class ViewAllImagesPage extends StatefulWidget {
   const ViewAllImagesPage({Key? key}) : super(key: key);
@@ -228,9 +231,20 @@ class _ViewAllImagesPageState extends State<ViewAllImagesPage> {
                   child: ValueListenableBuilder(
                     valueListenable: Hive.box<ImageNote>('image_notes').listenable(),
                     builder: (context, Box<ImageNote> box, _) {
+                      // PHASE14I-F: a legacy image whose migrated backend
+                      // counterpart already exists in _remoteImages is
+                      // left out of `merged` here — the Hive record
+                      // itself is untouched (box.values is never written
+                      // to). See legacy_media_reconciliation.dart.
+                      final unmigratedLegacy = suppressMigratedLegacyItems(
+                        legacyItems: box.values.toList(),
+                        remoteItems: _remoteImages,
+                        kind: LegacyMediaKind.image,
+                        legacyIdOf: (n) => n.id,
+                      );
                       final merged = <_VaultImage>[
                         ..._remoteImages.map((m) => _VaultImage.remote(m)),
-                        ...box.values.map((n) => _VaultImage.legacy(n)),
+                        ...unmigratedLegacy.map((n) => _VaultImage.legacy(n)),
                       ]..sort((a, b) => b.date.compareTo(a.date));
                       final filtered = merged
                           .where((item) => item.title.toLowerCase().contains(_search.toLowerCase()))

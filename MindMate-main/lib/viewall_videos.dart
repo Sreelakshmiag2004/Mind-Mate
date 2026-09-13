@@ -23,6 +23,9 @@ import 'package:flutter/services.dart';
 import 'core/network/api_exception.dart';
 import 'data/models/media/media_asset_model.dart';
 import 'data/repositories/media_repository.dart';
+// PHASE14I-F: suppresses a migrated legacy Hive video from this page's own
+// merged list — see legacy_media_reconciliation.dart's doc.
+import 'data/services/legacy_media_reconciliation.dart';
 import 'custom_snackbar.dart';
 
 class ViewAllVideosPage extends StatefulWidget {
@@ -232,9 +235,20 @@ class _ViewAllVideosPageState extends State<ViewAllVideosPage> {
                   child: ValueListenableBuilder(
                     valueListenable: Hive.box<VideoNote>('video_notes').listenable(),
                     builder: (context, Box<VideoNote> box, _) {
+                      // PHASE14I-F: a legacy video whose migrated backend
+                      // counterpart already exists in _remoteVideos is
+                      // left out of `merged` here — the Hive record
+                      // itself is untouched (box.values is never written
+                      // to). See legacy_media_reconciliation.dart.
+                      final unmigratedLegacy = suppressMigratedLegacyItems(
+                        legacyItems: box.values.toList(),
+                        remoteItems: _remoteVideos,
+                        kind: LegacyMediaKind.video,
+                        legacyIdOf: (n) => n.id,
+                      );
                       final merged = <_VaultVideo>[
                         ..._remoteVideos.map((m) => _VaultVideo.remote(m)),
-                        ...box.values.map((n) => _VaultVideo.legacy(n)),
+                        ...unmigratedLegacy.map((n) => _VaultVideo.legacy(n)),
                       ]..sort((a, b) => b.date.compareTo(a.date));
                       final filtered = merged
                           .where((item) => item.title.toLowerCase().contains(_search.toLowerCase()))

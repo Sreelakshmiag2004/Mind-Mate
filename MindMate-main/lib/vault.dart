@@ -35,6 +35,11 @@ import 'custom_snackbar.dart';
 // pushes this route. Nothing else in vault.dart references it — no
 // migration logic is duplicated here, only the navigation call.
 import 'legacy_media_migration_page.dart';
+// PHASE14I-F: suppresses a legacy Hive item from the merged lists below
+// once a valid migrated backend counterpart exists — see that file's own
+// doc for the full display-reconciliation contract. Also brings
+// LegacyMediaKind into scope (re-exported from the migration service).
+import 'data/services/legacy_media_reconciliation.dart';
 part 'vault.g.dart';
 
 class VaultPage extends StatefulWidget {
@@ -932,9 +937,20 @@ class _VaultPageState extends State<VaultPage> {
                         ValueListenableBuilder(
                           valueListenable: Hive.box<VoiceNote>('voice_notes').listenable(),
                           builder: (context, Box<VoiceNote> box, _) {
+                            // PHASE14I-F: a legacy voice note whose
+                            // migrated backend counterpart already exists
+                            // in _remoteVoiceNotes is left out of `merged`
+                            // here — the Hive record itself is untouched
+                            // (box.values is never written to).
+                            final unmigratedLegacy = suppressMigratedLegacyItems(
+                              legacyItems: box.values.toList(),
+                              remoteItems: _remoteVoiceNotes,
+                              kind: LegacyMediaKind.voice,
+                              legacyIdOf: (n) => n.id,
+                            );
                             final merged = <_VoiceItem>[
                               ..._remoteVoiceNotes.map((m) => _VoiceItem.remote(m)),
-                              ...box.values.map((n) => _VoiceItem.legacy(n)),
+                              ...unmigratedLegacy.map((n) => _VoiceItem.legacy(n)),
                             ]..sort((a, b) => b.date.compareTo(a.date));
                             final filtered = merged
                                 .where((item) => item.title.toLowerCase().contains(_voiceNoteSearch.toLowerCase()))
@@ -976,9 +992,19 @@ class _VaultPageState extends State<VaultPage> {
                                 // rather than redesigning it — see the
                                 // PHASE14G implementation report,
                                 // "Limitations."
+                                // PHASE14I-F: same reconciliation as the
+                                // compact list above, applied here too so
+                                // "View all" never shows a migrated item
+                                // twice either.
+                                final unmigratedLegacy = suppressMigratedLegacyItems(
+                                  legacyItems: Hive.box<VoiceNote>('voice_notes').values.toList(),
+                                  remoteItems: _remoteVoiceNotes,
+                                  kind: LegacyMediaKind.voice,
+                                  legacyIdOf: (n) => n.id,
+                                );
                                 final merged = <_VoiceItem>[
                                   ..._remoteVoiceNotes.map((m) => _VoiceItem.remote(m)),
-                                  ...Hive.box<VoiceNote>('voice_notes').values.map((n) => _VoiceItem.legacy(n)),
+                                  ...unmigratedLegacy.map((n) => _VoiceItem.legacy(n)),
                                 ]..sort((a, b) => b.date.compareTo(a.date));
                                 Navigator.push(
                                   context,
@@ -1083,9 +1109,20 @@ class _VaultPageState extends State<VaultPage> {
                         ValueListenableBuilder(
                           valueListenable: Hive.box<ImageNote>('image_notes').listenable(),
                           builder: (context, Box<ImageNote> box, _) {
+                            // PHASE14I-F: a legacy image whose migrated
+                            // backend counterpart already exists in
+                            // _remoteImages is left out of `merged` here —
+                            // the Hive record itself is untouched
+                            // (box.values is never written to).
+                            final unmigratedLegacy = suppressMigratedLegacyItems(
+                              legacyItems: box.values.toList(),
+                              remoteItems: _remoteImages,
+                              kind: LegacyMediaKind.image,
+                              legacyIdOf: (n) => n.id,
+                            );
                             final merged = <_VaultImage>[
                               ..._remoteImages.map((m) => _VaultImage.remote(m)),
-                              ...box.values.map((n) => _VaultImage.legacy(n)),
+                              ...unmigratedLegacy.map((n) => _VaultImage.legacy(n)),
                             ]..sort((a, b) => b.date.compareTo(a.date));
                             final filtered = merged
                                 .where((item) => item.title.toLowerCase().contains(_imageSearch.toLowerCase()))
@@ -1156,9 +1193,20 @@ class _VaultPageState extends State<VaultPage> {
                         ValueListenableBuilder(
                           valueListenable: Hive.box<VideoNote>('video_notes').listenable(),
                           builder: (context, Box<VideoNote> box, _) {
+                            // PHASE14I-F: a legacy video whose migrated
+                            // backend counterpart already exists in
+                            // _remoteVideos is left out of `merged` here —
+                            // the Hive record itself is untouched
+                            // (box.values is never written to).
+                            final unmigratedLegacy = suppressMigratedLegacyItems(
+                              legacyItems: box.values.toList(),
+                              remoteItems: _remoteVideos,
+                              kind: LegacyMediaKind.video,
+                              legacyIdOf: (n) => n.id,
+                            );
                             final merged = <_VaultVideo>[
                               ..._remoteVideos.map((m) => _VaultVideo.remote(m)),
-                              ...box.values.map((n) => _VaultVideo.legacy(n)),
+                              ...unmigratedLegacy.map((n) => _VaultVideo.legacy(n)),
                             ]..sort((a, b) => b.date.compareTo(a.date));
                             final filtered = merged
                                 .where((item) => item.title.toLowerCase().contains(_videoSearch.toLowerCase()))
