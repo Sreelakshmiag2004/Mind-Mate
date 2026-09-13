@@ -22,6 +22,15 @@ import 'package:video_player/video_player.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
+// PHASE14F: the active IMAGE flow only (creation/display/rename/delete)
+// now goes through MediaRepository (FastAPI/S3) instead of Hive — see
+// _uploadImage/_loadRemoteImages/_ImageListItem below, and the PHASE14F
+// implementation report. Voice notes and videos are untouched — they
+// still read/write Hive exactly as before this phase.
+import 'core/network/api_exception.dart';
+import 'data/models/media/media_asset_model.dart';
+import 'data/repositories/media_repository.dart';
+import 'custom_snackbar.dart';
 part 'vault.g.dart';
 
 class VaultPage extends StatefulWidget {
@@ -61,9 +70,195 @@ class _VaultPageState extends State<VaultPage> {
   String _imageSearch = '';
   String _videoSearch = '';
 
+  /// PHASE14F: this user's backend-hosted images (`GET /media?media_type=
+  /// image`), newest first. Populated once in [initState] and refreshed
+  /// after every successful upload/rename/delete — there is no shared/
+  /// global media state anywhere in the app (deliberately, per the
+  /// PHASE14F spec: no Provider/Riverpod/Bloc), so `ViewAllImagesPage`
+  /// loads its own independent copy the same way.
+  List<MediaAssetModel> _remoteImages = [];
+
   @override
   void initState() {
     super.initState();
+    _loadRemoteImages();
+  }
+
+  /// `GET /media?media_type=image` via [MediaRepository] — see
+  /// [_remoteImages]'s own doc. A failure here (network/5xx/401) leaves
+  /// [_remoteImages] at whatever it was before (empty on first load) and
+  /// surfaces a friendly error; it never silently pretends the list is
+  /// empty or crashes the page.
+  Future<void> _loadRemoteImages() async {
+    try {
+      final page = await MediaRepository.instance.list(mediaType: 'image', limit: 100, offset: 0);
+      if (!mounted) return;
+      setState(() { _remoteImages = page.items; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyImageMediaError(e), icon: Icons.error_outline);
+    }
+  }
+
+  /// PHASE14F image creation — replaces the old direct
+  /// `Hive.box<ImageNote>('image_notes').add(...)` call. New images are no
+  /// longer written to Hive at all; they exist only as a backend
+  /// [MediaAssetModel] from this
+  /// point on (pre-existing Hive `image_notes` are untouched and keep
+  /// showing up via [_VaultImage.legacy] — see that class's doc).
+  ///
+  /// Order of operations, matching the PHASE14F spec exactly: read bytes
+  /// -> determine content type -> size check -> `POST /media/upload` ->
+  /// `PATCH` the same title the old Hive flow always set from the picked
+  /// filename (the upload endpoint itself has no title field). The image
+  /// is only ever added to [_remoteImages] (i.e., considered "created")
+  /// once the upload itself has actually succeeded — never optimistically,
+  /// and never on a failed upload.
+  Future<void> _uploadImage(String pickedPath, String pickedFilename) async {
+    final file = File(pickedPath);
+    if (!await file.exists()) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't find that image on your device.", icon: Icons.error_outline);
+      return;
+    }
+
+    final contentType = imageContentTypeForFilename(pickedFilename);
+    if (contentType == null) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "That file type isn't supported.", icon: Icons.error_outline);
+      return;
+    }
+
+    final List<int> bytes;
+    try {
+      bytes = await file.readAsBytes();
+    } catch (_) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't read that image. Please try again.", icon: Icons.error_outline);
+      return;
+    }
+
+    // Client-side pre-check only, matching the backend's own default
+    // 25MB limit (PHASE14D audit report, Section 2) — the backend's 413
+    // remains the actual authority; this just avoids a wasted upload
+    // attempt for an obviously oversized file.
+    if (bytes.length > kMaxImageUploadBytes) {
+      if (!mounted) return;
+      showCustomSnackBar(context, 'That image is too large (max 25MB).', icon: Icons.error_outline);
+      return;
+    }
+
+    try {
+      final created = await MediaRepository.instance.upload(
+        fileBytes: bytes,
+        filename: pickedFilename,
+        contentType: contentType,
+      );
+
+      var result = created;
+      try {
+        result = await MediaRepository.instance.rename(mediaId: created.id, title: capitalizeIfNeeded(pickedFilename));
+      } on ApiException {
+        // The image itself is safely uploaded — only the title failed to
+        // save. Shown as its own, distinct message rather than treated as
+        // a failed upload (it isn't one): the user can retry the rename
+        // from the item's own menu.
+        if (mounted) {
+          showCustomSnackBar(
+            context,
+            'Image uploaded, but its title could not be saved. You can rename it from the menu.',
+            icon: Icons.info_outline,
+          );
+        }
+      }
+
+      if (!mounted) return;
+      setState(() { _remoteImages = [result, ..._remoteImages]; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyImageMediaError(e), icon: Icons.error_outline);
+    }
+  }
+
+  /// PHASE14F rename — [item] may be backend-hosted or a pre-existing
+  /// legacy Hive record; exactly one path runs, never both.
+  Future<void> _renameImage(_VaultImage item, String newTitle) async {
+    if (item.remote != null) {
+      try {
+        final updated = await MediaRepository.instance.rename(mediaId: item.remote!.id, title: newTitle);
+        if (!mounted) return;
+        setState(() {
+          _remoteImages = _remoteImages.map((m) => m.id == updated.id ? updated : m).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyImageMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14F behavior.
+    item.legacy!.title = newTitle;
+    await item.legacy!.save();
+  }
+
+  /// PHASE14F delete — same remote/legacy split as [_renameImage]. A
+  /// legacy item has no reliable backend media id (see PHASE14F spec,
+  /// "Delete flow"), so it is deleted locally exactly as before; this is
+  /// a deliberate, documented limitation, not an oversight — see the
+  /// PHASE14F implementation report.
+  Future<void> _deleteImage(_VaultImage item) async {
+    if (item.remote != null) {
+      try {
+        await MediaRepository.instance.delete(item.remote!.id);
+        if (!mounted) return;
+        setState(() {
+          _remoteImages = _remoteImages.where((m) => m.id != item.remote!.id).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyImageMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14F behavior (only
+    // removes the Hive record; the underlying file on disk is untouched,
+    // exactly as it always was — see PHASE14D audit report, Section 1).
+    await item.legacy!.delete();
+  }
+
+  /// PHASE14F: now an instance method (was a bare top-level function
+  /// taking an `ImageNote`) so Rename/Delete can go through
+  /// [_renameImage]/[_deleteImage] and update this State's own
+  /// [_remoteImages] on success — a bare top-level function has no way to
+  /// call [setState].
+  void _showImageMenu(BuildContext context, _VaultImage item) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: Icon(Icons.edit),
+            title: Text('Rename'),
+            onTap: () async {
+              Navigator.pop(context);
+              final newTitle = await _showRenameDialog(context, item.title);
+              if (newTitle != null && newTitle.isNotEmpty) {
+                await _renameImage(item, newTitle);
+              }
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.delete),
+            title: Text('Delete'),
+            onTap: () async {
+              Navigator.pop(context);
+              await _deleteImage(item);
+            },
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _startRecording() async {
@@ -498,33 +693,39 @@ class _VaultPageState extends State<VaultPage> {
                         Padding(
                           padding: const EdgeInsets.only(bottom: 12),
                           child: _SearchBar(
+                            // PHASE14F: picking an image now uploads it to
+                            // the backend via _uploadImage — it is no
+                            // longer written to Hive (see that method's
+                            // doc).
                             onAdd: () async {
                               FilePickerResult? result = await FilePicker.platform.pickFiles(
                                 type: FileType.image,
                                 allowMultiple: false,
                               );
                               if (result != null && result.files.single.path != null) {
-                                final file = File(result.files.single.path!);
-                                final id = const Uuid().v4();
-                                final note = ImageNote(
-                                  id: id,
-                                  path: file.path,
-                                  title: capitalizeIfNeeded(result.files.single.name),
-                                  date: DateTime.now(),
-                                );
-                                await Hive.box<ImageNote>('image_notes').add(note);
+                                await _uploadImage(result.files.single.path!, result.files.single.name);
                               }
                             },
                             onChanged: (v) => setState(() => _imageSearch = v),
                           ),
                         ),
                         SizedBox(height: 8),
+                        // PHASE14F: merges backend-hosted images
+                        // (_remoteImages) with pre-existing, not-yet-
+                        // migrated Hive image_notes (_VaultImage.legacy)
+                        // into one list, newest first — see _VaultImage's
+                        // own doc for why both still show up here.
                         ValueListenableBuilder(
                           valueListenable: Hive.box<ImageNote>('image_notes').listenable(),
                           builder: (context, Box<ImageNote> box, _) {
-                            final notes = box.values.toList().reversed.toList();
-                            final filteredNotes = notes.where((n) => n.title.toLowerCase().contains(_imageSearch.toLowerCase())).toList();
-                            if (filteredNotes.isEmpty) {
+                            final merged = <_VaultImage>[
+                              ..._remoteImages.map((m) => _VaultImage.remote(m)),
+                              ...box.values.map((n) => _VaultImage.legacy(n)),
+                            ]..sort((a, b) => b.date.compareTo(a.date));
+                            final filtered = merged
+                                .where((item) => item.title.toLowerCase().contains(_imageSearch.toLowerCase()))
+                                .toList();
+                            if (filtered.isEmpty) {
                               return const Padding(
                                 padding: EdgeInsets.symmetric(vertical: 16.0),
                                 child: Center(child: Text('No images uploaded')),
@@ -532,11 +733,12 @@ class _VaultPageState extends State<VaultPage> {
                             }
                             return Column(
                               children: [
-                                ...filteredNotes.take(2).map((note) => Padding(
+                                ...filtered.take(2).map((item) => Padding(
+                                  key: ValueKey(item.key),
                                   padding: const EdgeInsets.only(bottom: 8.0),
                                   child: _ImageListItem(
-                                    note: note,
-                                    onMenu: () => _showImageMenu(context, note),
+                                    item: item,
+                                    onMenu: () => _showImageMenu(context, item),
                                   ),
                                 )),
                               ],
@@ -799,10 +1001,181 @@ class _HorizontalList extends StatelessWidget {
   }
 }
 
+/// PHASE14F: unifies a backend-migrated image ([remote]) and a not-yet-
+/// migrated, Hive-only legacy image ([legacy]) into one displayable item.
+/// Exactly one of the two is ever non-null. Every NEW image created from
+/// this phase onward is [remote]; [legacy] exists purely so pre-existing
+/// Hive `image_notes` recorded before this phase keep showing up and stay
+/// renamable/deletable exactly as before — see the PHASE14F implementation
+/// report, "temporary compatibility fallback for pre-existing Hive
+/// images." [key] is a stable widget identity only, never a value sent to
+/// the backend or used to address a remote item — see [_VaultPageState.
+/// _renameImage]/[_deleteImage], which key off [remote]'s own server id.
+class _VaultImage {
+  const _VaultImage.remote(MediaAssetModel this.remote) : legacy = null;
+  const _VaultImage.legacy(ImageNote this.legacy) : remote = null;
+
+  final MediaAssetModel? remote;
+  final ImageNote? legacy;
+
+  String get title => legacy?.title ?? remote!.title ?? remote!.originalFilename ?? 'Untitled';
+  DateTime get date => legacy?.date ?? remote!.createdAt;
+  String get key => legacy != null ? 'legacy:${legacy!.id}' : 'remote:${remote!.id}';
+}
+
+/// Maps a picked image's filename extension to the exact content type the
+/// backend's upload allow-list accepts for images (PHASE14D audit report,
+/// Section 2; `ALLOWED_CONTENT_TYPES` in
+/// `backend/app/services/media_service.py`) — `null` for anything else,
+/// which PHASE14F treats as an unsupported type rather than guessing or
+/// forwarding an unvalidated value to the backend.
+String? imageContentTypeForFilename(String filename) {
+  final ext = filename.split('.').last.toLowerCase();
+  switch (ext) {
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'png':
+      return 'image/png';
+    case 'gif':
+      return 'image/gif';
+    case 'webp':
+      return 'image/webp';
+    default:
+      return null;
+  }
+}
+
+/// A client-side pre-check only, matching the backend's own default
+/// `max_upload_size_mb = 25` (PHASE14D audit report, Section 2) — the
+/// backend's own 413 response remains the actual authority; this constant
+/// just avoids a wasted upload attempt for an obviously oversized file.
+const int kMaxImageUploadBytes = 25 * 1024 * 1024;
+
+/// Maps a Vault-image [ApiException] to a short, clean, user-facing
+/// message — same approach as `vault_password.dart`'s
+/// `_friendlyVaultLockError`.
+String _friendlyImageMediaError(ApiException e) {
+  if (e is ValidationException) {
+    return "That image couldn't be saved — please check it and try again.";
+  }
+  if (e is NetworkException) {
+    return "Couldn't reach the server. Check your connection and try again.";
+  }
+  if (e is UnauthorizedException) {
+    return 'Your session has expired. Please log in again.';
+  }
+  if (e is NotFoundException) {
+    return 'That image could not be found.';
+  }
+  if (e.statusCode == 413) {
+    return 'That image is too large (max 25MB).';
+  }
+  if (e.statusCode == 415) {
+    return "That image type isn't supported.";
+  }
+  return 'Something went wrong with that image. Please try again.';
+}
+
 class _ImageListItem extends StatelessWidget {
-  final ImageNote note;
+  final _VaultImage item;
   final VoidCallback onMenu;
-  const _ImageListItem({required this.note, required this.onMenu});
+  const _ImageListItem({required this.item, required this.onMenu});
+
+  static Widget _placeholder({Widget? child}) => Container(
+    width: 48,
+    height: 48,
+    color: Colors.black12,
+    child: child == null ? null : Center(child: child),
+  );
+
+  /// PHASE14F: a backend-hosted image has no local file — its bytes are
+  /// only ever reachable via a freshly-resolved presigned `download_url`
+  /// (`GET /media/{id}`), never cached or persisted (PHASE14D audit
+  /// report, Section 3/4), so this is resolved fresh on every build.
+  Widget _buildThumbnail() {
+    if (item.legacy != null) {
+      return Image.file(
+        File(item.legacy!.path),
+        width: 48,
+        height: 48,
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) =>
+            _placeholder(child: const Icon(Icons.broken_image, color: Colors.grey)),
+      );
+    }
+    return FutureBuilder<MediaAssetModel>(
+      future: MediaRepository.instance.get(item.remote!.id),
+      builder: (context, snapshot) {
+        final url = snapshot.data?.downloadUrl;
+        if (snapshot.connectionState == ConnectionState.done && url != null) {
+          return Image.network(
+            url,
+            width: 48,
+            height: 48,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) =>
+                _placeholder(child: const Icon(Icons.broken_image, color: Colors.grey)),
+          );
+        }
+        if (snapshot.connectionState == ConnectionState.done) {
+          return _placeholder(child: const Icon(Icons.broken_image, color: Colors.grey));
+        }
+        return _placeholder(
+          child: const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+        );
+      },
+    );
+  }
+
+  void _openFullView(BuildContext context) {
+    final Widget content;
+    if (item.legacy != null) {
+      content = Image.file(
+        File(item.legacy!.path),
+        fit: BoxFit.contain,
+        errorBuilder: (context, error, stackTrace) => const Padding(
+          padding: EdgeInsets.all(32),
+          child: Icon(Icons.broken_image, color: Colors.white54, size: 48),
+        ),
+      );
+    } else {
+      content = FutureBuilder<MediaAssetModel>(
+        future: MediaRepository.instance.get(item.remote!.id),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Padding(padding: EdgeInsets.all(48), child: CircularProgressIndicator());
+          }
+          final url = snapshot.data?.downloadUrl;
+          if (url == null) {
+            return const Padding(
+              padding: EdgeInsets.all(32),
+              child: Icon(Icons.broken_image, color: Colors.white54, size: 48),
+            );
+          }
+          return Image.network(
+            url,
+            fit: BoxFit.contain,
+            errorBuilder: (context, error, stackTrace) => const Padding(
+              padding: EdgeInsets.all(32),
+              child: Icon(Icons.broken_image, color: Colors.white54, size: 48),
+            ),
+          );
+        },
+      );
+    }
+    showDialog(
+      context: context,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(16), color: Colors.black),
+          child: ClipRRect(borderRadius: BorderRadius.circular(16), child: content),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -814,35 +1187,10 @@ class _ImageListItem extends StatelessWidget {
       child: Row(
         children: [
           GestureDetector(
-            onTap: () {
-              showDialog(
-                context: context,
-                builder: (_) => Dialog(
-                  backgroundColor: Colors.transparent,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(16),
-                      color: Colors.black,
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(16),
-                      child: Image.file(
-                        File(note.path),
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            },
+            onTap: () => _openFullView(context),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: Image.file(
-                File(note.path),
-                width: 48,
-                height: 48,
-                fit: BoxFit.cover,
-              ),
+              child: _buildThumbnail(),
             ),
           ),
           SizedBox(width: 10),
@@ -851,10 +1199,10 @@ class _ImageListItem extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  note.title.length > 10 ? note.title.substring(0, 10) + '...' : note.title,
+                  item.title.length > 10 ? item.title.substring(0, 10) + '...' : item.title,
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                Text(DateFormat('dd-MM-yy').format(note.date), style: TextStyle(fontSize: 12, color: Colors.grey)),
+                Text(DateFormat('dd-MM-yy').format(item.date), style: TextStyle(fontSize: 12, color: Colors.grey)),
               ],
             ),
           ),
@@ -1058,37 +1406,6 @@ class _AllVoiceNotesPageState extends State<AllVoiceNotesPage> {
       ),
     );
   }
-}
-
-void _showImageMenu(BuildContext context, ImageNote note) {
-  showModalBottomSheet(
-    context: context,
-    builder: (context) => Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        ListTile(
-          leading: Icon(Icons.edit),
-          title: Text('Rename'),
-          onTap: () async {
-            Navigator.pop(context);
-            final newTitle = await _showRenameDialog(context, note.title);
-            if (newTitle != null && newTitle.isNotEmpty) {
-              note.title = newTitle;
-              await note.save();
-            }
-          },
-        ),
-        ListTile(
-          leading: Icon(Icons.delete),
-          title: Text('Delete'),
-          onTap: () async {
-            Navigator.pop(context);
-            await note.delete();
-          },
-        ),
-      ],
-    ),
-  );
 }
 
 Future<String?> _showRenameDialog(BuildContext context, String currentTitle) async {
