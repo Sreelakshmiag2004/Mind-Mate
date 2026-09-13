@@ -1,7 +1,10 @@
 /// Phase 7 added `/auth/*` and `/health`; Phase 8 added `/journals`; Phase 9
 /// added `/moods`; Phase 10 added `/checklists`; Phase 11B added
-/// `/scheduler`; Phase 13 added `/shoutouts`; Phase 14C adds `/vault/*`
-/// (the Vault lock only — Vault media/`/media` is not wired up yet).
+/// `/scheduler`; Phase 13 added `/shoutouts`; Phase 14C added `/vault/*`
+/// (the Vault lock only); Phase 14E adds `/media*` — the shared API layer
+/// only (see `MediaRepository`). No Vault screen calls it yet; that is
+/// deliberately deferred to the image/video/voice migration phases that
+/// follow (PHASE14D audit report, Section 13).
 ///
 /// Still deliberately limited to the features actually wired up so far —
 /// every other backend route (shoutouts, media, relationships, stress,
@@ -91,4 +94,20 @@ class ApiEndpoints {
   /// `last_viewed_at`/`previous_viewed_at` server-side — never call
   /// [vaultLock]'s `POST` for that; see PHASE14C implementation report.
   static const String vaultUnlock = '/vault/unlock';
+
+  /// `POST` only (multipart upload) — see `backend/app/api/routes/media.py`
+  /// and [ApiClient.uploadMultipart]. Distinct from [media]: this is the
+  /// one write endpoint that isn't at the bare `/media` collection path.
+  static const String mediaUpload = '/media/upload';
+
+  /// `GET` (list, with optional `media_type`/`limit`/`offset` query params)
+  /// lives at this exact path — see PHASE14D audit report, Section 2.
+  /// There is no `POST /media` (creation is only ever [mediaUpload]).
+  static const String media = '/media';
+
+  /// `GET` (one item, with a freshly-generated presigned `download_url`),
+  /// `PATCH` (rename — body is `{"title": ...}` only), and `DELETE`
+  /// (`204`) all address a single item by its backend-assigned id — same
+  /// pattern as [journalById]/[moodById]/[shoutoutById].
+  static String mediaById(String mediaId) => '$media/$mediaId';
 }

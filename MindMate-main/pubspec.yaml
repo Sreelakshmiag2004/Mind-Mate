@@ -70,6 +70,13 @@ dependencies:
   # lib/core/network/api_client.dart) possible without repeating that
   # logic at every call site. See PHASE7_API_INTEGRATION.md.
   dio: ^5.7.0
+  # PHASE14E: only for MediaType.parse(...), building the `file` part's
+  # Content-Type for ApiClient.uploadMultipart's MultipartFile.fromBytes.
+  # Already resolved transitively via dio (see pubspec.lock) — declared
+  # directly here only to satisfy the analyzer's
+  # depend_on_referenced_packages lint, not because the resolved version
+  # changes.
+  http_parser: ^4.1.2
   # flutter_secure_storage: the project's only pre-existing local-storage
   # options (Hive, shared_preferences) are plaintext-on-disk, which is
   # not acceptable for a long-lived refresh token. Keychain on iOS,

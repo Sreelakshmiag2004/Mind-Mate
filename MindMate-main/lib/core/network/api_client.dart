@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:http_parser/http_parser.dart' show MediaType;
 
 import '../config/app_config.dart';
 import '../storage/secure_storage_service.dart';
@@ -81,6 +82,47 @@ class ApiClient {
 
   Future<Map<String, dynamic>?> delete(String path, {Object? data, bool requiresAuth = true}) =>
       _send('DELETE', path, data: data, requiresAuth: requiresAuth);
+
+  /// PHASE14E: the one call in the app that sends a file's raw bytes
+  /// rather than a JSON body — currently only `POST /media/upload`
+  /// (`MediaRepository.upload`). Deliberately still the only place that
+  /// builds a [FormData]/[MultipartFile]: nothing above [ApiClient] (in
+  /// particular, `MediaRepository`) ever imports `package:dio/dio.dart`
+  /// itself, preserving this class's own "only I know about Dio" rule
+  /// (see the class doc above).
+  ///
+  /// [fileBytes]/[filename]/[contentType] become the multipart `file` part
+  /// exactly as `POST /media/upload` expects (`backend/app/api/routes/
+  /// media.py`); [fields] becomes any additional form fields — today only
+  /// ever `duration_seconds` (`MediaRepository.upload`) — sent as
+  /// plain-string form values, matching `Form(...)`'s parsing on the
+  /// FastAPI side. Deliberately does NOT accept a `media_type` parameter:
+  /// the backend derives it itself from the file's actual content type
+  /// (PHASE14D audit report, Section 2) — nothing here lets a caller
+  /// assert one.
+  ///
+  /// This deliberately does NOT touch `_dio.options.headers`'s global
+  /// `Content-Type: application/json` default, and does not set
+  /// `Content-Type`/the multipart boundary itself: passing a [FormData] as
+  /// `data` makes Dio's own request pipeline overwrite the Content-Type
+  /// header with the correct `multipart/form-data; boundary=...` for THIS
+  /// request only (verified directly against dio's `dio_mixin.dart`
+  /// `_transformData`) — every other call through [_send] is completely
+  /// unaffected.
+  Future<Map<String, dynamic>?> uploadMultipart(
+    String path, {
+    required List<int> fileBytes,
+    required String filename,
+    required String contentType,
+    Map<String, dynamic>? fields,
+    bool requiresAuth = true,
+  }) {
+    final formData = FormData.fromMap({
+      if (fields != null) ...fields,
+      'file': MultipartFile.fromBytes(fileBytes, filename: filename, contentType: MediaType.parse(contentType)),
+    });
+    return _send('POST', path, data: formData, requiresAuth: requiresAuth);
+  }
 
   /// Like [get], but for the handful of endpoints whose response body is a
   /// bare JSON array rather than an object — currently only
