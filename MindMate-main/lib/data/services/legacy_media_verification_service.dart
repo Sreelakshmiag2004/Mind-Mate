@@ -64,30 +64,43 @@ export 'legacy_media_migration_service.dart' show LegacyMediaKind;
 ///  6. `legacyCreatedAt` is present
 ///     ([LegacyMediaVerificationOutcome.missingLegacyCreatedAt]).
 ///  7. The LOCAL file's byte length (a filesystem `stat`, via
-///     [File.length] — the file's CONTENT is never read by this class;
-///     see "Memory/file-size safety" below) equals the backend's
-///     `fileSize` ([LegacyMediaVerificationOutcome.localFileUnreadable]
-///     if the file can't even be stat'd,
-///     [LegacyMediaVerificationOutcome.fileSizeMismatch] if the sizes
-///     differ). Checked BEFORE any network download, so an obviously
-///     wrong/missing local file never wastes a download.
+///     [File.length]) equals the backend's `fileSize`
+///     ([LegacyMediaVerificationOutcome.localFileUnreadable] if the file
+///     can't even be stat'd, [LegacyMediaVerificationOutcome.
+///     fileSizeMismatch] if the sizes differ). Checked BEFORE any local
+///     file read or network call, so an obviously wrong/missing local
+///     file never wastes either.
 ///  8. `checksumSha256` is present and is exactly 64 lowercase hex
 ///     characters ([LegacyMediaVerificationOutcome.missingChecksum] /
 ///     [LegacyMediaVerificationOutcome.invalidChecksum]).
-///  9. A fresh `GET /media/{id}` (never a cached/reused URL — the
-///     endpoint regenerates one on every call) yields a presigned
-///     download URL, and downloading it succeeds
+///  9. PHASE14I-I: the LOCAL file's actual CONTENT is hashed — see
+///     "Local file hashing" below — and that digest must exactly equal
+///     `checksumSha256` ([LegacyMediaVerificationOutcome.localHashFailed]
+///     if the file can't be read/hashed,
+///     [LegacyMediaVerificationOutcome.localChecksumMismatch] if the
+///     hashes differ). This is what actually closes the gap a file-size
+///     match alone leaves open — two files of identical length can still
+///     differ in content — and it runs BEFORE any network download, so a
+///     local file that's already provably wrong never costs one.
+/// 10. Only once the LOCAL file's hash has already matched does a fresh
+///     `GET /media/{id}` (never a cached/reused URL — the endpoint
+///     regenerates one on every call) fetch a presigned download URL,
+///     and the object is actually downloaded
 ///     ([LegacyMediaVerificationOutcome.downloadFailed] for any failure
-///     at either step — fetching detail or downloading the object).
-/// 10. See "How the JWT is kept off the presigned URL" below.
-/// 11. The downloaded byte count equals `fileSize`
+///     at either step).
+/// 11. See "How the JWT is kept off the presigned URL" below.
+/// 12. The downloaded byte count equals `fileSize`
 ///     ([LegacyMediaVerificationOutcome.downloadedSizeMismatch]).
-/// 12. SHA-256 is computed, on-device, from the downloaded bytes.
-/// 13. That computed digest exactly equals `checksumSha256`
+/// 13. SHA-256 is computed, on-device, from the downloaded bytes.
+/// 14. That computed digest exactly equals `checksumSha256`
 ///     ([LegacyMediaVerificationOutcome.checksumMismatch]).
 ///
-/// Only when all thirteen checks pass does [verify] return
-/// [LegacyMediaVerificationOutcome.verified].
+/// Only when every check above passes does [verify] return
+/// [LegacyMediaVerificationOutcome.verified] — at which point THREE
+/// independent facts have all been established: the local file's hash,
+/// the downloaded object's hash, and the backend's own recorded hash are
+/// all identical (see "Local file hashing" below for the full three-way
+/// chain this proves).
 ///
 /// ### How the JWT is kept off the presigned URL
 ///
@@ -101,35 +114,58 @@ export 'legacy_media_migration_service.dart' show LegacyMediaKind;
 /// different host than this backend, so attaching this app's JWT to it
 /// would leak an unrelated credential to a third party.
 ///
-/// ### Memory/file-size safety
+/// ### Local file hashing (PHASE14I-I)
 ///
-/// This class deliberately downloads the backend's copy fully into
-/// memory (a `List<int>`) rather than streaming it to a temporary file.
-/// This was a deliberate choice, not an oversight: the backend's own
-/// upload limit is 25MB (`max_upload_size_mb` in
+/// PHASE14I-H proved only `SHA256(downloaded backend bytes) ==
+/// backend.checksumSha256` — a size-only comparison stood in for the
+/// local file's own integrity, which left a real gap: two files of
+/// identical length can still differ in content, so nothing actually
+/// proved the LOCAL Hive file itself matches what's stored server-side.
+/// PHASE14I-I closes that gap by additionally computing
+/// `SHA256(local file bytes)` (step 9) and requiring it to equal
+/// `backend.checksumSha256` too. Combined with step 14's existing
+/// downloaded-bytes check, [verify] now proves all three of:
+///
+/// ```
+/// SHA256(local file bytes) == backend.checksumSha256
+/// SHA256(downloaded bytes) == backend.checksumSha256
+/// (transitively: SHA256(local file bytes) == SHA256(downloaded bytes))
+/// ```
+///
+/// The local file is read via [_openLocalFileStream] (default:
+/// [File.openRead], which yields the file in filesystem-sized chunks —
+/// typically tens of KB at a time, never the whole file at once) piped
+/// through `sha256.bind(...)` — [package:crypto]'s own `Hash` class is a
+/// `dart:convert` `Converter`, and `Converter.bind` is the standard,
+/// fully public Dart idiom for incremental/chunked conversion of a
+/// stream: it feeds each chunk into the hash's running internal state
+/// one at a time and only ever holds one chunk in memory at once,
+/// regardless of how large the source file is. This is opened **read-
+/// only** ([File.openRead] never opens for writing) and the file's
+/// content, timestamp, name, and location are never touched — hashing a
+/// file only ever reads bytes from it.
+///
+/// Local hashing runs BEFORE any network call (step 9, before step 10's
+/// download) — a local file that already fails its checksum comparison
+/// is reported [LegacyMediaVerificationOutcome.localChecksumMismatch]
+/// immediately, and the backend object is never downloaded at all.
+///
+/// ### Memory/download-size safety
+///
+/// The backend's copy is still downloaded fully into memory (a
+/// `List<int>`) rather than streamed to a temporary file — this remains
+/// a deliberate choice from PHASE14I-H, unaffected by this phase: the
+/// backend's own upload limit is 25MB (`max_upload_size_mb` in
 /// `backend/app/core/config.py`), a size any mobile device can safely
-/// hold in memory without risk, and buffering in memory keeps this
-/// class's only network dependency ([MediaRepository.downloadBytes])
-/// injectable as a single async closure returning `List<int>` — exactly
-/// the same "inject a closure, keep unit tests free of real I/O" pattern
-/// [LegacyMediaMigrationService] already established for local file
-/// reads. Streaming to a temporary file would additionally introduce a
-/// new "delete this scratch file when done" responsibility this class
-/// would have to get right on every exit path (including every early
-/// failure return above) purely to stay memory-efficient at a size where
-/// memory was never actually a practical concern — added complexity
-/// without a corresponding safety benefit at this size limit. If the
-/// upload size limit is ever raised substantially, this trade-off should
-/// be revisited.
-///
-/// The ORIGINAL local file's bytes are never read by this class at all —
-/// only its length (a cheap `stat`) is ever inspected (step 7). The
-/// SHA-256 comparison (steps 12-13) is entirely between the backend's
-/// stored digest and a fresh download of the backend's own object; this
-/// class never hashes the local file's content, matching the audit
-/// report's own framing: verification proves "the object currently in
-/// storage is still byte-identical to what the backend recorded a hash
-/// for at upload time," not "the local file was itself always valid."
+/// hold in memory without risk, and buffering in memory keeps
+/// [MediaRepository.downloadBytes] injectable as a single async closure
+/// returning `List<int>`. The LOCAL file, by contrast, IS now read via a
+/// genuinely chunked stream (see above) rather than a single
+/// `readAsBytes()` call — there was no reason to accept an unbounded
+/// single allocation for the one read this class performs that didn't
+/// already have a good reason to be bounded (the download's own 25MB
+/// cap), so local hashing uses the stronger, stream-based approach
+/// throughout, per this phase's own instruction to prefer it.
 ///
 /// ### Integration (deliberately deferred)
 ///
@@ -142,8 +178,10 @@ class LegacyMediaVerificationService {
   LegacyMediaVerificationService({
     MediaRepository? mediaRepository,
     Future<int> Function(String path)? localFileLength,
+    Stream<List<int>> Function(String path)? openLocalFileStream,
   }) : _mediaRepository = mediaRepository ?? MediaRepository.instance,
-       _localFileLength = localFileLength ?? _defaultLocalFileLength;
+       _localFileLength = localFileLength ?? _defaultLocalFileLength,
+       _openLocalFileStream = openLocalFileStream ?? _defaultOpenLocalFileStream;
 
   /// Lazily-constructed app-wide singleton, matching
   /// `LegacyMediaMigrationService.instance`/`MediaRepository.instance`.
@@ -156,10 +194,32 @@ class LegacyMediaVerificationService {
   final MediaRepository _mediaRepository;
   final Future<int> Function(String path) _localFileLength;
 
+  /// PHASE14I-I. Injectable purely so a test can supply a controlled,
+  /// observably-multi-chunk `Stream<List<int>>` without a real file on
+  /// disk — production always uses [File.openRead], which reads the file
+  /// **read-only** and yields it in filesystem-sized chunks.
+  final Stream<List<int>> Function(String path) _openLocalFileStream;
+
   static Future<int> _defaultLocalFileLength(String path) =>
       File(path).length();
 
+  static Stream<List<int>> _defaultOpenLocalFileStream(String path) =>
+      File(path).openRead();
+
   static final RegExp _sha256HexPattern = RegExp(r'^[0-9a-f]{64}$');
+
+  /// PHASE14I-I. Hashes [stream] incrementally via `sha256.bind` (see the
+  /// class doc, "Local file hashing") — never buffers the whole source
+  /// into one `List<int>` first. Used for BOTH the local file (via
+  /// [_openLocalFileStream]) and, for symmetry/consistency, could equally
+  /// hash any other byte stream; today it is only ever called with the
+  /// local file's stream, since the downloaded backend bytes already
+  /// arrive as a single in-memory `List<int>` (see "Memory/download-size
+  /// safety") and are hashed directly with `sha256.convert`.
+  static Future<String> _hashStream(Stream<List<int>> stream) async {
+    final digest = await sha256.bind(stream).single;
+    return digest.toString();
+  }
 
   /// Verifies exactly one legacy Hive item — see the class doc for the
   /// full, ordered algorithm. Never throws: any exception at any step
@@ -277,7 +337,31 @@ class LegacyMediaVerificationService {
         );
       }
 
-      // Step 9 — a FRESH presigned URL (GET /media/{id} regenerates one
+      // Step 9 (PHASE14I-I) — hash the LOCAL file's actual content,
+      // incrementally (see the class doc, "Local file hashing"), and
+      // require it to already match the backend's checksum BEFORE ever
+      // attempting a network download. This is the check that actually
+      // closes the "size matched, but were the bytes really the same?"
+      // gap a file-size comparison alone leaves open.
+      final String localChecksum;
+      try {
+        localChecksum = await _hashStream(_openLocalFileStream(localFilePath));
+      } catch (_) {
+        return _result(
+          LegacyMediaVerificationOutcome.localHashFailed,
+          legacySource,
+          backendMediaId: summary.id,
+        );
+      }
+      if (localChecksum != expectedChecksum) {
+        return _result(
+          LegacyMediaVerificationOutcome.localChecksumMismatch,
+          legacySource,
+          backendMediaId: summary.id,
+        );
+      }
+
+      // Step 10 — a FRESH presigned URL (GET /media/{id} regenerates one
       // on every call; never reuse one obtained earlier), then the
       // actual byte download.
       final MediaAssetModel detail;
@@ -310,7 +394,7 @@ class LegacyMediaVerificationService {
         );
       }
 
-      // Step 11.
+      // Step 12.
       if (downloadedBytes.length != summary.fileSize) {
         return _result(
           LegacyMediaVerificationOutcome.downloadedSizeMismatch,
@@ -319,7 +403,7 @@ class LegacyMediaVerificationService {
         );
       }
 
-      // Steps 12-13.
+      // Steps 13-14.
       final downloadedChecksum = sha256.convert(downloadedBytes).toString();
       if (downloadedChecksum != expectedChecksum) {
         return _result(
@@ -373,6 +457,19 @@ enum LegacyMediaVerificationOutcome {
   fileSizeMismatch('file_size_mismatch'),
   missingChecksum('missing_checksum'),
   invalidChecksum('invalid_checksum'),
+
+  /// PHASE14I-I. The local file could not be read/hashed — e.g. a
+  /// permissions error or a read failure partway through, distinct from
+  /// [localFileUnreadable] (which means the file couldn't even be
+  /// stat'd for its size, one step earlier).
+  localHashFailed('local_hash_failed'),
+
+  /// PHASE14I-I. `SHA256(local file bytes) != backend.checksumSha256` —
+  /// the local file has the RIGHT size but the WRONG content. This is
+  /// the specific check that proves size equality alone can never be
+  /// enough to consider an item safe to clean up.
+  localChecksumMismatch('local_checksum_mismatch'),
+
   downloadFailed('download_failed'),
   downloadedSizeMismatch('downloaded_size_mismatch'),
   checksumMismatch('checksum_mismatch'),
@@ -438,12 +535,16 @@ class LegacyMediaVerificationResult {
         return 'The backend record has no integrity checksum yet.';
       case LegacyMediaVerificationOutcome.invalidChecksum:
         return 'The backend record\'s checksum is malformed.';
+      case LegacyMediaVerificationOutcome.localHashFailed:
+        return 'This device\'s copy of the file could not be verified.';
+      case LegacyMediaVerificationOutcome.localChecksumMismatch:
+        return 'This device\'s file does not match the backend record\'s content.';
       case LegacyMediaVerificationOutcome.downloadFailed:
         return 'Could not download the backend copy to verify it.';
       case LegacyMediaVerificationOutcome.downloadedSizeMismatch:
         return 'The downloaded file size did not match the backend record.';
       case LegacyMediaVerificationOutcome.checksumMismatch:
-        return 'The downloaded file\'s content does not match the backend record.';
+        return 'The downloaded backend copy\'s content does not match the backend record.';
       case LegacyMediaVerificationOutcome.unexpectedError:
         return 'An unexpected error occurred while verifying this item.';
     }
