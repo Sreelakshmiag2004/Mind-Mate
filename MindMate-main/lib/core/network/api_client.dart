@@ -24,9 +24,10 @@ import 'api_exception.dart';
 /// 3. Converting every Dio failure into a typed [ApiException] so nothing
 ///    above this layer ever catches a raw [DioException].
 class ApiClient {
-  ApiClient({Dio? dio, TokenStorage? tokenStorage, String? baseUrl})
+  ApiClient({Dio? dio, TokenStorage? tokenStorage, String? baseUrl, Dio? downloadDio})
     : _tokenStorage = tokenStorage ?? SecureTokenStorage(),
-      _dio = dio ?? Dio() {
+      _dio = dio ?? Dio(),
+      _downloadDio = downloadDio ?? Dio() {
     // Applied unconditionally — including to an injected `dio` (tests pass
     // one to swap in a fake HttpClientAdapter) — rather than only when this
     // constructor builds its own Dio instance. Without this, Dio's default
@@ -47,9 +48,25 @@ class ApiClient {
     _dio.interceptors.add(
       InterceptorsWrapper(onRequest: _attachAuthHeader, onResponse: _rejectErrorStatusCodes),
     );
+
+    // PHASE14I-H: [_downloadDio] backs [downloadBytes] — see that
+    // method's own doc for why it deliberately gets NEITHER of the two
+    // interceptors above (no Bearer-header attachment, no 401-refresh
+    // logic) and no shared `baseUrl` (every call passes a full absolute
+    // URL already). It exists as its own field — rather than a fresh
+    // `Dio()` constructed inside [downloadBytes] itself — solely so a
+    // test can inject a scripted `HttpClientAdapter` onto it the exact
+    // same way `dio` already lets tests do for every other method (see
+    // `test/core/network/api_client_upload_test.dart`'s `_ScriptedAdapter`
+    // pattern) — production code never needs to pass this parameter.
+    _downloadDio.options.connectTimeout = AppConfig.requestTimeout;
+    _downloadDio.options.receiveTimeout = AppConfig.requestTimeout;
+    _downloadDio.options.sendTimeout = AppConfig.requestTimeout;
+    _downloadDio.options.validateStatus = (_) => true;
   }
 
   final Dio _dio;
+  final Dio _downloadDio;
   final TokenStorage _tokenStorage;
 
   /// Non-null exactly while a refresh is in flight. Every 401 that arrives
@@ -122,6 +139,44 @@ class ApiClient {
       'file': MultipartFile.fromBytes(fileBytes, filename: filename, contentType: MediaType.parse(contentType)),
     });
     return _send('POST', path, data: formData, requiresAuth: requiresAuth);
+  }
+
+  /// PHASE14I-H: downloads raw bytes from an absolute URL — used only for
+  /// a presigned S3/MinIO object download URL (see
+  /// `LegacyMediaVerificationService`, which is the one caller of this
+  /// method, via `MediaRepository.downloadBytes`).
+  ///
+  /// Goes through [_downloadDio] — a Dio instance that NEVER has
+  /// [_attachAuthHeader]/[_rejectErrorStatusCodes] registered on it,
+  /// unlike [_dio] — never [_dio] itself. A presigned URL already carries
+  /// its own delegated, time-limited authorization in its signed query
+  /// string, and typically points at a completely different host (object
+  /// storage, not this backend's own `AppConfig.apiBaseUrl`). Using a
+  /// separate Dio instance with no such interceptor makes it structurally
+  /// impossible for this app's Bearer JWT to ever be attached to this
+  /// request, rather than relying on correctly threading a
+  /// `requiresAuth: false` flag through the very interceptor this method
+  /// must never go near.
+  Future<List<int>> downloadBytes(String url) async {
+    final Response<List<int>> response;
+    try {
+      response = await _downloadDio.get<List<int>>(url, options: Options(responseType: ResponseType.bytes));
+    } on DioException catch (error) {
+      throw ApiException.fromDioException(error);
+    }
+
+    final statusCode = response.statusCode ?? 0;
+    if (statusCode < 200 || statusCode >= 300) {
+      throw ApiException.fromDioException(
+        DioException(requestOptions: response.requestOptions, response: response, type: DioExceptionType.badResponse),
+      );
+    }
+
+    final data = response.data;
+    if (data == null) {
+      throw const UnknownApiException('The download returned no data.', statusCode: null);
+    }
+    return data;
   }
 
   /// Like [get], but for the handful of endpoints whose response body is a

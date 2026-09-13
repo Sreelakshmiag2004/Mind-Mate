@@ -38,6 +38,7 @@ class MediaAssetModel {
     required this.createdAt,
     this.legacySource,
     this.legacyCreatedAt,
+    this.checksumSha256,
     this.downloadUrl,
     this.downloadUrlExpiresInSeconds,
   });
@@ -90,6 +91,19 @@ class MediaAssetModel {
   /// migrated note's real date, `createdAt` is migration time).
   final DateTime? legacyCreatedAt;
 
+  /// PHASE14I-G.1/H. Mirrors the backend's `MediaAssetRead.checksum_sha256`
+  /// — the lowercase hex SHA-256 digest of the exact bytes this backend
+  /// received for this upload, computed once at upload time. `null` for
+  /// every row created before PHASE14I-G.1's backend change (no backfill
+  /// was performed there) and, in principle, for any future row whose
+  /// hash somehow can't be computed, though no such path exists today.
+  /// Decoded because [LegacyMediaVerificationService] needs it back to
+  /// compare against a freshly-downloaded copy's own locally-computed
+  /// hash — see that class's own doc for the full verify-before-delete
+  /// contract this exists to support. Never derived from — and never
+  /// exposes — the storage `object_key` or any filesystem path.
+  final String? checksumSha256;
+
   /// Non-null only when this was parsed from `GET /media/{id}`'s
   /// `MediaAssetDetail` response — a time-limited URL the client can use
   /// to fetch the object's bytes directly, bypassing this API. Never a
@@ -118,6 +132,7 @@ class MediaAssetModel {
       legacyCreatedAt: json['legacy_created_at'] != null
           ? DateTime.parse(json['legacy_created_at'] as String)
           : null,
+      checksumSha256: json['checksum_sha256'] as String?,
       downloadUrl: json['download_url'] as String?,
       downloadUrlExpiresInSeconds:
           json['download_url_expires_in_seconds'] as int?,
@@ -136,6 +151,7 @@ class MediaAssetModel {
     'legacy_source': legacySource,
     if (legacyCreatedAt != null)
       'legacy_created_at': legacyCreatedAt!.toIso8601String(),
+    'checksum_sha256': checksumSha256,
     if (downloadUrl != null) 'download_url': downloadUrl,
     if (downloadUrlExpiresInSeconds != null)
       'download_url_expires_in_seconds': downloadUrlExpiresInSeconds,

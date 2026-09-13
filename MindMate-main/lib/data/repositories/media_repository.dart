@@ -159,4 +159,15 @@ class MediaRepository {
   Future<void> delete(String mediaId) async {
     await _apiClient.delete(ApiEndpoints.mediaById(mediaId));
   }
+
+  /// PHASE14I-H: downloads the raw bytes at an arbitrary absolute [url] —
+  /// used only for a presigned download URL obtained from [get]'s
+  /// [MediaAssetModel.downloadUrl], by [LegacyMediaVerificationService].
+  /// A thin passthrough to [ApiClient.downloadBytes] (see that method's
+  /// own doc for why it never attaches this app's Bearer JWT to the
+  /// request) — kept here, rather than the verification service calling
+  /// [ApiClient] directly, so [MediaRepository] stays the one layer that
+  /// knows how Vault media talks to the backend, matching every other
+  /// method in this class.
+  Future<List<int>> downloadBytes(String url) => _apiClient.downloadBytes(url);
 }
