@@ -155,6 +155,23 @@ def build_download_url(storage: ObjectStorageService, asset: MediaAsset) -> str:
     )
 
 
+def update_media_title(db: Session, *, user_id: uuid.UUID, media_id: uuid.UUID, title: str) -> MediaAsset:
+    """
+    PHASE14B rename. Ownership is enforced the exact same way as every
+    other media operation (`get_by_id_for_user`, 404 if missing/not
+    theirs) — this never touches object storage at all: the object itself
+    is never renamed, only this row's `title` column.
+    """
+    asset = media_repository.get_by_id_for_user(db, media_id=media_id, user_id=user_id)
+    if asset is None:
+        raise NotFoundError("Media not found")
+
+    media_repository.update_title(db, asset, title=title)
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
 def delete_media(db: Session, storage: ObjectStorageService, *, user_id: uuid.UUID, media_id: uuid.UUID) -> None:
     asset = media_repository.get_by_id_for_user(db, media_id=media_id, user_id=user_id)
     if asset is None:

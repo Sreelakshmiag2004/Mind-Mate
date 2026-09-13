@@ -13,6 +13,7 @@ from app.api.routes import (
     schedulers,
     shoutouts,
     stress,
+    vault,
 )
 from app.core.config import settings
 
@@ -48,3 +49,4 @@ app.include_router(relationships.router)
 app.include_router(stress.router)
 app.include_router(reflections.router)
 app.include_router(schedulers.router)
+app.include_router(vault.router)

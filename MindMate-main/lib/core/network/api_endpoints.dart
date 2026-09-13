@@ -1,6 +1,7 @@
 /// Phase 7 added `/auth/*` and `/health`; Phase 8 added `/journals`; Phase 9
 /// added `/moods`; Phase 10 added `/checklists`; Phase 11B added
-/// `/scheduler`; Phase 13 adds `/shoutouts`.
+/// `/scheduler`; Phase 13 added `/shoutouts`; Phase 14C adds `/vault/*`
+/// (the Vault lock only — Vault media/`/media` is not wired up yet).
 ///
 /// Still deliberately limited to the features actually wired up so far —
 /// every other backend route (shoutouts, media, relationships, stress,
@@ -78,4 +79,16 @@ class ApiEndpoints {
   /// shoutout, by id. A second call for the same shoutout 409s — see
   /// PHASE13 backend contract verification report, Section 5.
   static String shoutoutFeelBetter(String shoutoutId) => '${shoutoutById(shoutoutId)}/feel-better';
+
+  /// `GET` (current state) and `POST` (create — one per user, 409 if one
+  /// already exists) both live at this exact path — see PHASE14B backend
+  /// contract report and `backend/app/api/routes/vault.py`. Deliberately
+  /// separate from [media]/`/media` (not wired up yet — see PHASE14A/C):
+  /// this is the Vault *lock/password* only, not Vault media storage.
+  static const String vaultLock = '/vault/lock';
+
+  /// Verifies the Vault password and, on success, advances
+  /// `last_viewed_at`/`previous_viewed_at` server-side — never call
+  /// [vaultLock]'s `POST` for that; see PHASE14C implementation report.
+  static const String vaultUnlock = '/vault/unlock';
 }

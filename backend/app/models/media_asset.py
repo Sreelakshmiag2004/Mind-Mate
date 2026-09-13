@@ -16,6 +16,17 @@ hex}{extension}`) — never derived from the client-supplied filename, so
 nothing about the original name, its extension, or path characters ever
 reaches the storage key. `original_filename` is kept purely for display
 and is never trusted for anything else (see app/services/media_service.py).
+
+PHASE14B adds `title`: a separate, nullable, user-editable display name
+(Vault's rename feature — `note.title = ...; note.save()` in
+`vault.dart`/`viewall_images.dart`/`viewall_videos.dart`). Deliberately a
+new column rather than repurposing `original_filename` for it:
+`original_filename` is documented above as set once at upload time and
+"never trusted for anything else" — overloading it as a mutable rename
+target would silently break that contract for every existing caller.
+Every row defaults to `title = NULL` (nothing has been renamed yet); a
+`NULL` title is not an error state anywhere in this API — see
+app/schemas/media.py/app/api/routes/media.py's `PATCH /media/{media_id}`.
 """
 
 import uuid
@@ -46,6 +57,10 @@ class MediaAsset(Base, TimestampMixin):
 
     media_type: Mapped[str] = mapped_column(String(10), nullable=False)
     original_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # PHASE14B: the Vault rename target — see the module docstring. Kept
+    # deliberately separate from original_filename, both in column and in
+    # meaning; NULL until a caller PATCHes it.
+    title: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     object_key: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)

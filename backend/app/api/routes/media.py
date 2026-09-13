@@ -11,7 +11,7 @@ from app.dependencies.auth import get_current_active_user
 from app.dependencies.pagination import PaginationParams, pagination_params
 from app.models.user import User
 from app.schemas.common import Page
-from app.schemas.media import MediaAssetDetail, MediaAssetRead
+from app.schemas.media import MediaAssetDetail, MediaAssetRead, MediaAssetUpdate
 from app.services import media_service
 from app.services.media_service import DOWNLOAD_URL_EXPIRES_IN_SECONDS
 from app.services.storage import ObjectStorageService, get_storage_service
@@ -116,6 +116,31 @@ def get_media(
         download_url=download_url,
         download_url_expires_in_seconds=DOWNLOAD_URL_EXPIRES_IN_SECONDS,
     )
+
+
+@router.patch(
+    "/{media_id}",
+    response_model=MediaAssetRead,
+    summary="Rename a media item",
+    description=(
+        "PHASE14B. Updates ONLY the display `title` — never object_key, media_type, duration_seconds, "
+        "original_filename, or ownership; the stored object itself is never renamed. 404 if it doesn't exist "
+        "OR isn't yours. A blank/whitespace-only title is rejected with 422."
+    ),
+)
+def update_media(
+    media_id: uuid.UUID,
+    payload: MediaAssetUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MediaAssetRead:
+    try:
+        asset = media_service.update_media_title(
+            db, user_id=current_user.id, media_id=media_id, title=payload.title
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return MediaAssetRead.model_validate(asset)
 
 
 @router.delete(

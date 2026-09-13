@@ -14,6 +14,7 @@ from app.models.checklist import ChecklistItem, ChecklistCompletion
 from app.models.scheduler import SchedulerEntry
 from app.models.shoutout import Shoutout
 from app.models.media_asset import MediaAsset
+from app.models.vault_lock import VaultLock
 from app.models.relationship import Relationship
 from app.models.relationship_invitation import RelationshipInvitation
 from app.models.relationship_permission import RelationshipPermission
@@ -31,6 +32,7 @@ __all__ = [
     "SchedulerEntry",
     "Shoutout",
     "MediaAsset",
+    "VaultLock",
     "Relationship",
     "RelationshipInvitation",
     "RelationshipPermission",

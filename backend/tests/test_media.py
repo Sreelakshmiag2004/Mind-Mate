@@ -195,6 +195,168 @@ def test_invalid_uuid_returns_422(client: TestClient):
     assert client.get("/media/not-a-uuid", headers=headers).status_code == 422
 
 
+# --- PHASE14B: media rename (title) ---
+
+
+def test_authenticated_rename_succeeds(client: TestClient):
+    headers = register_and_get_headers(client, "rename1@example.com")
+    created = _upload(client, headers).json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Beach trip"}, headers=headers)
+
+    assert response.status_code == 200
+
+
+def test_returned_title_is_correct(client: TestClient):
+    headers = register_and_get_headers(client, "rename2@example.com")
+    created = _upload(client, headers).json()
+    assert created["title"] is None  # never renamed yet
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Beach trip"}, headers=headers)
+
+    assert response.json()["title"] == "Beach trip"
+
+
+def test_title_persists_after_get(client: TestClient):
+    headers = register_and_get_headers(client, "rename3@example.com")
+    created = _upload(client, headers).json()
+    client.patch(f"/media/{created['id']}", json={"title": "Beach trip"}, headers=headers)
+
+    response = client.get(f"/media/{created['id']}", headers=headers)
+
+    assert response.json()["title"] == "Beach trip"
+
+
+def test_title_persists_after_list(client: TestClient):
+    headers = register_and_get_headers(client, "rename4@example.com")
+    created = _upload(client, headers).json()
+    client.patch(f"/media/{created['id']}", json={"title": "Beach trip"}, headers=headers)
+
+    response = client.get("/media", headers=headers)
+
+    assert response.json()["items"][0]["title"] == "Beach trip"
+
+
+def test_null_title_remains_valid_for_a_never_renamed_item(client: TestClient):
+    headers = register_and_get_headers(client, "rename5@example.com")
+    created = _upload(client, headers).json()
+
+    get_response = client.get(f"/media/{created['id']}", headers=headers)
+    list_response = client.get("/media", headers=headers)
+
+    assert created["title"] is None
+    assert get_response.json()["title"] is None
+    assert list_response.json()["items"][0]["title"] is None
+
+
+def test_maximum_valid_length_title_is_accepted(client: TestClient):
+    headers = register_and_get_headers(client, "rename6@example.com")
+    created = _upload(client, headers).json()
+    title_200 = "x" * 200
+
+    response = client.patch(f"/media/{created['id']}", json={"title": title_200}, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["title"] == title_200
+
+
+def test_over_limit_title_returns_422(client: TestClient):
+    headers = register_and_get_headers(client, "rename7@example.com")
+    created = _upload(client, headers).json()
+    title_201 = "x" * 201
+
+    response = client.patch(f"/media/{created['id']}", json={"title": title_201}, headers=headers)
+
+    assert response.status_code == 422
+
+
+def test_empty_string_title_returns_422(client: TestClient):
+    headers = register_and_get_headers(client, "rename8@example.com")
+    created = _upload(client, headers).json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": ""}, headers=headers)
+
+    assert response.status_code == 422
+
+
+def test_whitespace_only_title_returns_422(client: TestClient):
+    headers = register_and_get_headers(client, "rename9@example.com")
+    created = _upload(client, headers).json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "   "}, headers=headers)
+
+    assert response.status_code == 422
+
+
+def test_rename_nonexistent_media_returns_404(client: TestClient):
+    headers = register_and_get_headers(client, "rename10@example.com")
+
+    response = client.patch(f"/media/{uuid.uuid4()}", json={"title": "x"}, headers=headers)
+
+    assert response.status_code == 404
+
+
+def test_rename_another_users_media_returns_404(client: TestClient):
+    owner_headers = register_and_get_headers(client, "rename11owner@example.com")
+    other_headers = register_and_get_headers(client, "rename11other@example.com")
+    created = _upload(client, owner_headers).json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Hijacked"}, headers=other_headers)
+
+    assert response.status_code == 404
+    still_owned = client.get(f"/media/{created['id']}", headers=owner_headers)
+    assert still_owned.json()["title"] != "Hijacked"
+
+
+def test_unauthenticated_rename_is_rejected(client: TestClient):
+    response = client.patch(f"/media/{uuid.uuid4()}", json={"title": "x"})
+    assert response.status_code == 401
+
+
+def test_rename_does_not_change_the_stored_object_key(client: TestClient):
+    """object_key is never exposed directly, but the presigned download URL embeds it (memory://<object_key>?...),
+    so an unchanged prefix is direct evidence the object itself was never renamed/moved."""
+    headers = register_and_get_headers(client, "rename12@example.com")
+    created = _upload(client, headers).json()
+    before_url = client.get(f"/media/{created['id']}", headers=headers).json()["download_url"]
+    before_key = before_url.split("?", 1)[0]
+
+    client.patch(f"/media/{created['id']}", json={"title": "Renamed"}, headers=headers)
+
+    after_url = client.get(f"/media/{created['id']}", headers=headers).json()["download_url"]
+    after_key = after_url.split("?", 1)[0]
+    assert after_key == before_key
+
+
+def test_rename_does_not_change_media_type(client: TestClient):
+    headers = register_and_get_headers(client, "rename13@example.com")
+    created = _upload(client, headers, filename="clip.mp4", content=b"video-bytes", content_type="video/mp4").json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Renamed"}, headers=headers)
+
+    assert response.json()["media_type"] == "video"
+
+
+def test_rename_does_not_change_duration(client: TestClient):
+    headers = register_and_get_headers(client, "rename14@example.com")
+    created = _upload(
+        client, headers, filename="a.m4a", content=b"audio-bytes", content_type="audio/mp4", duration_seconds=99
+    ).json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Renamed"}, headers=headers)
+
+    assert response.json()["duration_seconds"] == 99
+
+
+def test_rename_does_not_change_original_filename(client: TestClient):
+    headers = register_and_get_headers(client, "rename15@example.com")
+    created = _upload(client, headers, filename="original name.png").json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Renamed"}, headers=headers)
+
+    assert response.json()["original_filename"] == "original name.png"
+
+
 def test_upload_media_cleans_up_orphaned_object_on_db_failure(db_session, storage, monkeypatch):
     """
     Service-level test (not through the API): simulates a DB commit

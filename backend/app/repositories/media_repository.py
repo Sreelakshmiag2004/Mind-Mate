@@ -64,3 +64,12 @@ def create(
 
 def delete(db: Session, asset: MediaAsset) -> None:
     db.delete(asset)
+
+
+def update_title(db: Session, asset: MediaAsset, *, title: str) -> MediaAsset:
+    """PHASE14B: rename — updates ONLY `title`. Never touches object_key,
+    media_type, duration_seconds, original_filename, or ownership."""
+    asset.title = title
+    db.add(asset)
+    db.flush()
+    return asset
