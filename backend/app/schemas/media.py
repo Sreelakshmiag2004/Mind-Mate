@@ -59,6 +59,17 @@ class MediaAssetRead(BaseModel):
     # when the note was originally made, and should not be presented as
     # the note's date for a migrated item.
     legacy_created_at: Optional[datetime] = None
+    # PHASE14I-G.1. The lowercase hex SHA-256 digest of the exact bytes
+    # this backend received for this upload — see
+    # app/services/media_service.py's module docstring for exactly where
+    # it's computed. `None` for every row created before this phase (no
+    # backfill is performed — see the PHASE14I-G.1 implementation
+    # report's "Historical-row behavior") and, in principle, for any
+    # future row whose hash somehow can't be computed, though no such
+    # path exists today. Never derived from — and never exposes — the
+    # storage `object_key`, a filesystem path, or any other metadata; it
+    # is purely a content fingerprint of the file's own bytes.
+    checksum_sha256: Optional[str] = None
     created_at: datetime
 
 

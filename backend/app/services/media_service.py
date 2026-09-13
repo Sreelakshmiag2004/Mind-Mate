@@ -68,6 +68,22 @@ concurrent race:
      matching the contract's preferred behavior over surfacing a 409 to
      a client that will just retry anyway.
 
+PHASE14I-G.1 — SHA-256 content integrity foundation:
+
+Immediately after `_validate_and_read` accepts `data` (i.e., after
+content-type and size validation, but before that same `data` is ever
+handed to `storage.upload`), `upload_media` computes
+`hashlib.sha256(data).hexdigest()` and stores it as the new row's
+`checksum_sha256`. This is deliberately the ONLY thing hashed — never
+`original_filename`, `object_key`, `content_type`, or any other metadata
+— so the stored digest represents exactly the byte sequence written to
+S3/MinIO, nothing else. This phase adds no verification logic that reads
+the digest back; it only guarantees every newly-uploaded row has one.
+Existing rows (created before this phase) keep `checksum_sha256 = NULL`
+forever unless re-uploaded — no backfill job exists or is planned by
+this phase (see the PHASE14I-G.1 implementation report, "Historical-row
+behavior").
+
 Limitation (also called out in the implementation report): step 2's
 `IntegrityError` handling assumes that when `legacy_source` is set,
 `uq_media_assets_user_id_legacy_source` is the only unique constraint an
@@ -86,6 +102,7 @@ is a real, always-enforced uniqueness rule) rather than on a
 would-be-approximate test.
 """
 
+import hashlib
 import logging
 import uuid
 from datetime import datetime
@@ -162,6 +179,14 @@ def upload_media(
 
     media_type, extension = _validate_and_read(content_type, data)
 
+    # PHASE14I-G.1: hashed here — after validation has confirmed `data`
+    # is the real, size-checked upload payload, and BEFORE it is handed
+    # to storage — so `checksum_sha256` always represents exactly the
+    # bytes that get written to S3/MinIO. Only `data` itself is ever
+    # hashed: never original_filename, object_key (not even generated
+    # yet at this point), content_type, or any other metadata.
+    checksum_sha256 = hashlib.sha256(data).hexdigest()
+
     # Server-generated, UUID-based — never derived from `original_filename`,
     # so nothing about the client-supplied name (or path characters in it)
     # ever reaches the storage key. See module docstring for the full
@@ -182,6 +207,7 @@ def upload_media(
             duration_seconds=duration_seconds,
             legacy_source=legacy_source,
             legacy_created_at=legacy_created_at,
+            checksum_sha256=checksum_sha256,
         )
         db.commit()
         db.refresh(asset)

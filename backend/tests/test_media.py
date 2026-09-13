@@ -1,4 +1,6 @@
+import hashlib
 import io
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -795,11 +797,372 @@ def test_migration_upgrade_and_downgrade_add_legacy_source(tmp_path, monkeypatch
             )
     engine.dispose()
 
-    command.downgrade(alembic_cfg, "-1")
+    # Targets this migration's own revision explicitly rather than a
+    # relative "-1" — PHASE14I-G.1 added a new migration on top of this
+    # one, so "-1" from head no longer lands here; an explicit target
+    # keeps this test correct regardless of how many migrations are later
+    # stacked on top of the one it actually exercises.
+    command.downgrade(alembic_cfg, "a7b8c9d0e1f2")
 
     engine = create_engine(db_url)
     inspector = inspect(engine)
     columns_after_downgrade = {c["name"] for c in inspector.get_columns("media_assets")}
     assert "legacy_source" not in columns_after_downgrade
     assert "legacy_created_at" not in columns_after_downgrade
+    engine.dispose()
+
+
+# --- PHASE14I-G.1: SHA-256 content-integrity checksum ---
+
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def test_checksum_is_calculated_from_exact_uploaded_bytes(client: TestClient):
+    content = b"the exact bytes this test uploads"
+    headers = register_and_get_headers(client, "checksum1@example.com")
+
+    response = _upload(client, headers, content=content)
+
+    assert response.status_code == 201
+    assert response.json()["checksum_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_known_byte_sequence_produces_expected_sha256(client: TestClient):
+    # A fixed, hand-verifiable input/output pair rather than only comparing
+    # against hashlib's own output (which test_checksum_is_calculated_from_
+    # exact_uploaded_bytes already does) — this pins the exact algorithm.
+    content = b"hello world"
+    expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    assert hashlib.sha256(content).hexdigest() == expected  # sanity: the pin itself is correct
+
+    headers = register_and_get_headers(client, "checksum2@example.com")
+    response = _upload(client, headers, content=content)
+
+    assert response.json()["checksum_sha256"] == expected
+
+
+def test_stored_db_checksum_equals_expected_sha256(client: TestClient, db_session):
+    from app.models.media_asset import MediaAsset
+
+    content = b"verify the actual database row, not just the response"
+    headers = register_and_get_headers(client, "checksum3@example.com")
+    created_id = _upload(client, headers, content=content).json()["id"]
+
+    row = db_session.get(MediaAsset, uuid.UUID(created_id))
+    assert row.checksum_sha256 == hashlib.sha256(content).hexdigest()
+
+
+def test_upload_response_contains_checksum_sha256(client: TestClient):
+    headers = register_and_get_headers(client, "checksum4@example.com")
+
+    response = _upload(client, headers)
+
+    assert "checksum_sha256" in response.json()
+
+
+def test_list_media_returns_checksum_sha256(client: TestClient):
+    content = b"listed item bytes"
+    headers = register_and_get_headers(client, "checksum5@example.com")
+    _upload(client, headers, content=content)
+
+    response = client.get("/media", headers=headers)
+
+    assert response.json()["items"][0]["checksum_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_get_media_detail_returns_checksum_sha256(client: TestClient):
+    content = b"detail item bytes"
+    headers = register_and_get_headers(client, "checksum6@example.com")
+    created = _upload(client, headers, content=content).json()
+
+    response = client.get(f"/media/{created['id']}", headers=headers)
+
+    assert response.json()["checksum_sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_two_different_files_produce_different_checksums(client: TestClient):
+    headers = register_and_get_headers(client, "checksum7@example.com")
+
+    first = _upload(client, headers, content=b"file one contents").json()
+    second = _upload(client, headers, content=b"file two contents, different").json()
+
+    assert first["checksum_sha256"] != second["checksum_sha256"]
+
+
+def test_same_bytes_produce_the_same_checksum(client: TestClient):
+    content = b"identical bytes uploaded twice, as two separate normal uploads"
+    headers = register_and_get_headers(client, "checksum8@example.com")
+
+    first = _upload(client, headers, filename="a.png", content=content).json()
+    second = _upload(client, headers, filename="b.png", content=content).json()
+
+    assert first["id"] != second["id"]  # two distinct, unrelated uploads
+    assert first["checksum_sha256"] == second["checksum_sha256"]
+
+
+def test_empty_file_behaves_per_existing_validation_with_no_checksum_side_effect(
+    client: TestClient, storage
+):
+    headers = register_and_get_headers(client, "checksum9@example.com")
+
+    response = _upload(client, headers, content=b"")
+
+    assert response.status_code == 415  # unchanged from existing behavior (test_empty_file_is_rejected)
+    assert storage.count() == 0
+    assert client.get("/media", headers=headers).json()["total"] == 0
+
+
+def test_existing_row_with_null_checksum_remains_readable(client: TestClient, db_session):
+    """
+    Simulates a row created before PHASE14I-G.1 (checksum_sha256 always
+    NULL for those, by design — see the implementation report's
+    "Historical-row behavior") by inserting one directly, bypassing the
+    upload path entirely, then confirming the read endpoints still work.
+    """
+    from app.models.media_asset import MediaAsset
+    from app.repositories import user_repository
+
+    headers = register_and_get_headers(client, "checksum10@example.com")
+    user = user_repository.get_by_email(db_session, "checksum10@example.com")
+
+    pre_existing = MediaAsset(
+        user_id=user.id,
+        media_type="image",
+        object_key="image/pre-existing/legacy.png",
+        content_type="image/png",
+        file_size=10,
+        checksum_sha256=None,
+    )
+    db_session.add(pre_existing)
+    db_session.commit()
+
+    list_response = client.get("/media", headers=headers)
+    assert list_response.status_code == 200
+    assert list_response.json()["items"][0]["checksum_sha256"] is None
+
+    detail_response = client.get(f"/media/{pre_existing.id}", headers=headers)
+    assert detail_response.status_code == 200
+    assert detail_response.json()["checksum_sha256"] is None
+
+
+def test_legacy_source_duplicate_prevention_still_works_with_checksum_added(client: TestClient, storage):
+    headers = register_and_get_headers(client, "checksum11@example.com")
+
+    first = _upload(client, headers, legacy_source="image:checksum-dup").json()
+    second = _upload(client, headers, legacy_source="image:checksum-dup").json()
+
+    assert first["id"] == second["id"]
+    assert storage.count() == 1
+    assert client.get("/media", headers=headers).json()["total"] == 1
+
+
+def test_upload_storage_failure_creates_no_row_and_no_checksum(client: TestClient, storage, monkeypatch):
+    headers = register_and_get_headers(client, "checksum12@example.com")
+
+    def _always_fail(*args, **kwargs):
+        raise StorageError("simulated storage outage")
+
+    monkeypatch.setattr(storage, "upload", _always_fail)
+
+    response = _upload(client, headers)
+
+    assert response.status_code == 502
+    assert storage.count() == 0
+    assert client.get("/media", headers=headers).json()["total"] == 0
+
+
+def test_db_failure_after_storage_upload_still_compensates_with_checksum_present(
+    db_session, storage, monkeypatch
+):
+    """
+    Re-verifies the existing orphan-cleanup compensation (see
+    test_upload_media_cleans_up_orphaned_object_on_db_failure) is not
+    weakened by this phase's addition of a new `checksum_sha256` keyword
+    argument to media_repository.create.
+    """
+    from app.repositories import media_repository
+    from app.services import media_service
+    from sqlalchemy.exc import SQLAlchemyError
+
+    def _always_fail(*args, **kwargs):
+        raise SQLAlchemyError("simulated DB outage")
+
+    monkeypatch.setattr(media_repository, "create", _always_fail)
+
+    with pytest.raises(SQLAlchemyError):
+        media_service.upload_media(
+            db_session,
+            storage,
+            user_id=uuid.uuid4(),
+            data=b"some bytes",
+            content_type="image/png",
+            original_filename="x.png",
+            duration_seconds=None,
+        )
+
+    assert storage.count() == 0  # the object was compensated away, not left orphaned
+
+
+def test_jwt_ownership_still_enforced_for_checksum_bearing_media(client: TestClient):
+    owner_headers = register_and_get_headers(client, "checksum13owner@example.com")
+    other_headers = register_and_get_headers(client, "checksum13other@example.com")
+    created = _upload(client, owner_headers, content=b"owner-only bytes").json()
+
+    response = client.get(f"/media/{created['id']}", headers=other_headers)
+
+    assert response.status_code == 404  # same IDOR-resistant 404, unaffected by the new field
+
+
+def test_object_key_not_exposed_alongside_checksum(client: TestClient):
+    headers = register_and_get_headers(client, "checksum14@example.com")
+    created = _upload(client, headers).json()
+
+    detail = client.get(f"/media/{created['id']}", headers=headers).json()
+
+    assert "checksum_sha256" in created
+    assert "object_key" not in created
+    assert "checksum_sha256" in detail
+    assert "object_key" not in detail
+
+
+def test_no_filesystem_path_exposed_in_upload_or_detail_response(client: TestClient):
+    headers = register_and_get_headers(client, "checksum15@example.com")
+    created = _upload(client, headers, filename="my_photo.png").json()
+
+    detail = client.get(f"/media/{created['id']}", headers=headers).json()
+
+    for body in (created, detail):
+        for key, value in body.items():
+            if isinstance(value, str):
+                assert not value.startswith("/"), f"{key!r} looks like a filesystem path: {value!r}"
+                assert "\\" not in value, f"{key!r} looks like a Windows filesystem path: {value!r}"
+
+
+def test_checksum_is_exactly_64_lowercase_hex_characters(client: TestClient):
+    headers = register_and_get_headers(client, "checksum16@example.com")
+
+    response = _upload(client, headers)
+
+    checksum = response.json()["checksum_sha256"]
+    assert _SHA256_HEX_PATTERN.match(checksum), f"not a 64-char lowercase hex string: {checksum!r}"
+
+
+def test_checksum_is_not_derived_from_filename_or_title(client: TestClient):
+    content = b"identical bytes, wildly different filenames and titles"
+    headers = register_and_get_headers(client, "checksum17@example.com")
+
+    first = _upload(client, headers, filename="alpha.png", content=content).json()
+    second = _upload(client, headers, filename="totally-different-name.png", content=content).json()
+    client.patch(f"/media/{second['id']}", json={"title": "A completely different title"}, headers=headers)
+    second_after_rename = client.get(f"/media/{second['id']}", headers=headers).json()
+
+    assert first["checksum_sha256"] == second["checksum_sha256"] == second_after_rename["checksum_sha256"]
+
+
+def test_checksum_calculated_before_storage_persistence_from_exact_captured_bytes(db_session, storage):
+    """
+    Wraps the storage fake's own `upload` to capture exactly the bytes
+    handed to it, proving the persisted `checksum_sha256` is the SHA-256
+    of THOSE bytes — not of the multipart wrapper, metadata, or anything
+    reconstructed after the fact. `BytesIO.getvalue()` doesn't disturb the
+    stream's read position, so the real (wrapped) upload still receives
+    the identical, unconsumed fileobj afterward.
+    """
+    from app.services import media_service
+
+    captured: dict = {}
+    original_upload = storage.upload
+
+    def _capturing_upload(*, object_key, fileobj, content_type):
+        captured["bytes"] = fileobj.getvalue()
+        return original_upload(object_key=object_key, fileobj=fileobj, content_type=content_type)
+
+    storage.upload = _capturing_upload
+
+    content = b"the precise bytes that must reach both storage and the checksum"
+    asset = media_service.upload_media(
+        db_session,
+        storage,
+        user_id=uuid.uuid4(),
+        data=content,
+        content_type="image/png",
+        original_filename="a.png",
+        duration_seconds=None,
+    )
+
+    assert captured["bytes"] == content
+    expected = hashlib.sha256(captured["bytes"]).hexdigest()
+    assert asset.checksum_sha256 == expected
+    assert hashlib.sha256(content).hexdigest() == expected  # the checksum matches the ORIGINAL bytes too
+
+
+def test_migration_upgrade_and_downgrade_add_checksum_sha256(tmp_path, monkeypatch):
+    """
+    Runs the ACTUAL Alembic migration chain (see
+    test_migration_upgrade_and_downgrade_add_legacy_source's own doc for
+    why this suite does that instead of relying on
+    Base.metadata.create_all() here) against a throwaway SQLite file,
+    verifying this migration's upgrade() adds `checksum_sha256` and its
+    length CHECK constraint, that the constraint actually rejects a
+    too-short value while allowing NULL and a genuine 64-character one,
+    and that downgrade() removes everything it added — including that
+    batch-mode's SQLite table-recreate strategy preserves existing rows.
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect, text
+
+    from app.core.config import settings
+
+    db_path = tmp_path / "phase14ig1_migration_test.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", db_url)
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    alembic_cfg = Config(str(backend_dir / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+
+    command.upgrade(alembic_cfg, "head")
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    columns = {c["name"] for c in inspector.get_columns("media_assets")}
+    assert "checksum_sha256" in columns
+
+    user_id = uuid.uuid4().hex
+    base_cols = "id, user_id, media_type, object_key, content_type, file_size, checksum_sha256"
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, NULL)"),
+            {"id": uuid.uuid4().hex, "uid": user_id, "key": "k1"},
+        )
+        conn.execute(
+            text(
+                f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, :sum)"
+            ),
+            {"id": uuid.uuid4().hex, "uid": user_id, "key": "k2", "sum": "a" * 64},
+        )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, :sum)"
+                ),
+                {"id": uuid.uuid4().hex, "uid": user_id, "key": "k3", "sum": "too-short"},
+            )
+    engine.dispose()
+
+    # Explicit target, not a relative "-1" — see the same reasoning in
+    # test_migration_upgrade_and_downgrade_add_legacy_source, now applied
+    # to this migration's own down_revision.
+    command.downgrade(alembic_cfg, "b8c9d0e1f2a3")
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    columns_after_downgrade = {c["name"] for c in inspector.get_columns("media_assets")}
+    assert "checksum_sha256" not in columns_after_downgrade
+    with engine.connect() as conn:
+        # batch-mode's recreate-table strategy must preserve existing rows.
+        assert conn.execute(text("SELECT COUNT(*) FROM media_assets")).scalar_one() == 2
     engine.dispose()

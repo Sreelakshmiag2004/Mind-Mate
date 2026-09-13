@@ -50,6 +50,24 @@ actual migration, and no Flutter/Hive code is touched by this phase):
   row — see app/services/media_service.py for exactly how the two are
   populated and app/schemas/media.py for how a client should choose
   between them for display.
+
+PHASE14I-G.1 adds `checksum_sha256`: a single additive, nullable column
+holding the lowercase hex SHA-256 digest of the exact bytes this backend
+received and wrote to object storage for this row — see
+app/services/media_service.py's module docstring for exactly where and
+how it is computed. It exists to eventually let a future, still-unbuilt
+verification step prove "the object currently in S3/MinIO is still
+byte-identical to what was uploaded," which is the one thing the
+existing `legacy_source`/`legacy_created_at` migration-tracking columns
+were never meant to guarantee on their own (see the PHASE14I-G audit
+report, "Byte-level verification audit"). `NULL` for every row created
+before this phase — this phase never back-fills a checksum for a
+historical row, since doing so would require re-reading and re-hashing
+an object this backend has never re-examined since it was first written
+(see the PHASE14I-G.1 implementation report, "Historical-row behavior",
+for why that is explicitly out of scope here). No verification logic of
+any kind is implemented by this phase; only the durable place to store
+its future input.
 """
 
 import uuid
@@ -69,6 +87,22 @@ class MediaAsset(Base, TimestampMixin):
     __table_args__ = (
         CheckConstraint("media_type IN ('voice', 'image', 'video')", name="ck_media_assets_media_type"),
         CheckConstraint("file_size > 0", name="ck_media_assets_file_size_positive"),
+        # PHASE14I-G.1: a SHA-256 hex digest is always exactly 64
+        # characters — this catches a truncated/malformed value at the
+        # database level regardless of which code path ever writes one.
+        # Deliberately just a length check, not a full `[0-9a-f]{64}`
+        # character-class check: SQLite has no portable equivalent to
+        # PostgreSQL's `~` regex operator (see the GUID/legacy_source
+        # partial-index comments elsewhere in this file for the same
+        # cross-dialect-portability concern), and this project's test
+        # suite runs against SQLite (tests/conftest.py). The hex-only
+        # guarantee is instead an application-level one: the sole writer
+        # of this column, app/services/media_service.py, only ever stores
+        # `hashlib.sha256(data).hexdigest()`'s direct output.
+        CheckConstraint(
+            "checksum_sha256 IS NULL OR length(checksum_sha256) = 64",
+            name="ck_media_assets_checksum_sha256_length",
+        ),
         # Supports "my media, newest first" and "my voice notes only" /
         # "my images only" listings without a full-table scan per user.
         Index("ix_media_assets_user_id_created_at", "user_id", "created_at"),
@@ -123,6 +157,11 @@ class MediaAsset(Base, TimestampMixin):
     # see app/schemas/media.py for how a naive client-supplied value is
     # normalized before it ever reaches this column.
     legacy_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # PHASE14I-G.1 — see module docstring. NULL for every row created
+    # before this phase and for any future row whose hash somehow can't
+    # be computed (there is no such path today, but the column stays
+    # nullable rather than assuming one can never exist).
+    checksum_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     user: Mapped["User"] = relationship()  # noqa: F821
 

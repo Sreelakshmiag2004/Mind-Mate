@@ -77,6 +77,7 @@ def create(
     duration_seconds: Optional[int],
     legacy_source: Optional[str] = None,
     legacy_created_at: Optional[datetime] = None,
+    checksum_sha256: Optional[str] = None,
 ) -> MediaAsset:
     asset = MediaAsset(
         user_id=user_id,
@@ -88,6 +89,7 @@ def create(
         duration_seconds=duration_seconds,
         legacy_source=legacy_source,
         legacy_created_at=legacy_created_at,
+        checksum_sha256=checksum_sha256,
     )
     db.add(asset)
     db.flush()
