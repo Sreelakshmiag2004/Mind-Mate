@@ -78,10 +78,31 @@ class _VaultPageState extends State<VaultPage> {
   /// loads its own independent copy the same way.
   List<MediaAssetModel> _remoteImages = [];
 
+  /// PHASE14G: this user's backend-hosted voice notes (`GET /media?
+  /// media_type=voice`), newest first — same pattern as [_remoteImages].
+  /// A recording or an imported audio file is added here (never to Hive)
+  /// once its upload actually succeeds; existing Hive `voice_notes` are
+  /// untouched and keep showing up via `_VoiceItem.legacy`.
+  List<MediaAssetModel> _remoteVoiceNotes = [];
+
   @override
   void initState() {
     super.initState();
     _loadRemoteImages();
+    _loadRemoteVoiceNotes();
+  }
+
+  /// `GET /media?media_type=voice` via [MediaRepository] — see
+  /// [_remoteVoiceNotes]'s own doc.
+  Future<void> _loadRemoteVoiceNotes() async {
+    try {
+      final page = await MediaRepository.instance.list(mediaType: 'voice', limit: 100, offset: 0);
+      if (!mounted) return;
+      setState(() { _remoteVoiceNotes = page.items; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyVoiceMediaError(e), icon: Icons.error_outline);
+    }
   }
 
   /// `GET /media?media_type=image` via [MediaRepository] — see
@@ -299,24 +320,83 @@ class _VaultPageState extends State<VaultPage> {
     await FirebaseFirestore.instance.collection('users').doc(username).collection('voice_notes').doc(id).set(note.toMap());
   }
 
-  void _playVoiceNote(VoiceNote note) async {
-    if (_currentPlayingId == note.id && _isPlaying) {
+  /// PHASE14G: [item] may be backend-hosted or a pre-existing legacy Hive
+  /// record. A legacy item plays exactly as before
+  /// (`DeviceFileSource(item.legacy!.localPath)`); a backend item resolves
+  /// a fresh presigned URL and plays that via [_playRemoteVoiceNote] — see
+  /// that method's own doc for the expired-URL retry behavior.
+  void _playVoiceNote(_VoiceItem item) async {
+    if (_currentPlayingId == item.key && _isPlaying) {
       await _audioPlayer.pause();
       setState(() { _isPlaying = false; });
       return;
     }
     await _audioPlayer.stop();
-    await _audioPlayer.play(DeviceFileSource(note.localPath));
+    if (item.legacy != null) {
+      await _audioPlayer.play(DeviceFileSource(item.legacy!.localPath));
+    } else {
+      final started = await _playRemoteVoiceNote(_audioPlayer, item.remote!.id);
+      if (!started) {
+        if (!mounted) return;
+        showCustomSnackBar(context, "Couldn't play that voice note. Please try again.", icon: Icons.error_outline);
+        return;
+      }
+    }
     setState(() {
       _isPlaying = true;
-      _currentPlayingId = note.id;
+      _currentPlayingId = item.key;
     });
     _audioPlayer.onPlayerComplete.listen((event) {
       setState(() { _isPlaying = false; });
     });
   }
 
-  void _showVoiceNoteMenu(BuildContext context, VoiceNote note) {
+  /// PHASE14G rename — [item] may be backend-hosted or a pre-existing
+  /// legacy Hive record; exactly one path runs, never both. Same shape as
+  /// PHASE14F's `_renameImage`.
+  Future<void> _renameVoiceNote(_VoiceItem item, String newTitle) async {
+    if (item.remote != null) {
+      try {
+        final updated = await MediaRepository.instance.rename(mediaId: item.remote!.id, title: newTitle);
+        if (!mounted) return;
+        setState(() {
+          _remoteVoiceNotes = _remoteVoiceNotes.map((m) => m.id == updated.id ? updated : m).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyVoiceMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14G behavior.
+    item.legacy!.title = newTitle;
+    await item.legacy!.save();
+  }
+
+  /// PHASE14G delete — same remote/legacy split as [_renameVoiceNote]. A
+  /// legacy item has no reliable backend media id, so it is deleted
+  /// locally exactly as before — a deliberate, documented limitation, same
+  /// as PHASE14F's `_deleteImage`.
+  Future<void> _deleteVoiceNote(_VoiceItem item) async {
+    if (item.remote != null) {
+      try {
+        await MediaRepository.instance.delete(item.remote!.id);
+        if (!mounted) return;
+        setState(() {
+          _remoteVoiceNotes = _remoteVoiceNotes.where((m) => m.id != item.remote!.id).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyVoiceMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14G behavior (only
+    // removes the Hive record; the underlying file on disk is untouched).
+    await item.legacy!.delete();
+  }
+
+  void _showVoiceNoteMenu(BuildContext context, _VoiceItem item) {
     showModalBottomSheet(
       context: context,
       builder: (context) => Column(
@@ -327,10 +407,9 @@ class _VaultPageState extends State<VaultPage> {
             title: Text('Rename'),
             onTap: () async {
               Navigator.pop(context);
-              final newTitle = await _showRenameDialog(context, note.title);
+              final newTitle = await _showRenameDialog(context, item.title);
               if (newTitle != null && newTitle.isNotEmpty) {
-                note.title = newTitle;
-                await note.save();
+                await _renameVoiceNote(item, newTitle);
               }
             },
           ),
@@ -339,7 +418,7 @@ class _VaultPageState extends State<VaultPage> {
             title: Text('Delete'),
             onTap: () async {
               Navigator.pop(context);
-              await note.delete();
+              await _deleteVoiceNote(item);
             },
           ),
         ],
@@ -383,44 +462,112 @@ class _VaultPageState extends State<VaultPage> {
     });
   }
 
+  /// PHASE14G: replaces the old direct
+  /// `Hive.box<VoiceNote>('voice_notes').add(...)` call. A finished
+  /// recording is now uploaded through [MediaRepository] instead — it is
+  /// no longer written to Hive at all.
+  /// Recordings are always `.m4a` (the `record` package's default
+  /// `RecordConfig()`, unchanged by this phase), which maps to backend
+  /// content type `audio/mp4` — see [voiceContentTypeForFilename].
   Future<void> _stopFloatingRecordingAndSave() async {
-    print('Attempting to stop recording...');
     String? path;
     try {
       path = await _recorder.stop();
-      print('Recorder stopped, path: $path');
-    } catch (e) {
-      print('Error stopping recorder: $e');
+    } catch (_) {
+      // Matches the pre-PHASE14G behavior: a recorder-stop failure is
+      // swallowed here (nothing was ever captured to upload).
     } finally {
       _timer?.cancel();
       setState(() {
         _isFloatingRecording = false;
       });
     }
-    if (path == null) {
-      print('No path returned from recorder.stop()');
+    if (path == null) return;
+
+    final now = DateTime.now();
+    final title = DateFormat('yyyyMMdd_HHmmss').format(now);
+    final duration = await _audioPlayer.setSourceDeviceFile(path).then((_) => _audioPlayer.getDuration());
+    await _uploadVoiceNote(
+      path: path,
+      filename: '${const Uuid().v4()}.m4a',
+      title: title,
+      duration: duration,
+    );
+  }
+
+  /// PHASE14G shared upload path for both a finished recording
+  /// ([_stopFloatingRecordingAndSave]) and an imported audio file (the
+  /// Voice Notes `_SearchBar.onAdd` below) — same order of operations as
+  /// PHASE14F's `_uploadImage`: verify the file exists -> read bytes ->
+  /// determine content type -> size check -> `POST /media/upload` ->
+  /// `PATCH` the title (the upload endpoint itself has no title field) ->
+  /// only then considered "created." [duration], when known, is sent as
+  /// `duration_seconds` — the backend's own "client-reported, display-
+  /// only" field for voice/video (PHASE14D audit report, Section 2).
+  Future<void> _uploadVoiceNote({
+    required String path,
+    required String filename,
+    required String title,
+    Duration? duration,
+  }) async {
+    final file = File(path);
+    if (!await file.exists()) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't find that voice note on your device.", icon: Icons.error_outline);
       return;
     }
+
+    final contentType = voiceContentTypeForFilename(filename);
+    if (contentType == null) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "That audio file type isn't supported.", icon: Icons.error_outline);
+      return;
+    }
+
+    final List<int> bytes;
     try {
-      final file = File(path);
-      print('File exists: ${await file.exists()}');
-      final duration = await _audioPlayer.setSourceDeviceFile(path).then((_) => _audioPlayer.getDuration());
-      print('Duration: $duration');
-      final id = const Uuid().v4();
-      final now = DateTime.now();
-      final title = DateFormat('yyyyMMdd_HHmmss').format(now);
-      final note = VoiceNote(
-        id: id,
-        title: title,
-        url: path,
-        localPath: path,
-        date: now,
-        duration: duration ?? Duration.zero,
+      bytes = await file.readAsBytes();
+    } catch (_) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't read that voice note. Please try again.", icon: Icons.error_outline);
+      return;
+    }
+
+    if (bytes.length > kMaxVoiceUploadBytes) {
+      if (!mounted) return;
+      showCustomSnackBar(context, 'That voice note is too large (max 25MB).', icon: Icons.error_outline);
+      return;
+    }
+
+    try {
+      final created = await MediaRepository.instance.upload(
+        fileBytes: bytes,
+        filename: filename,
+        contentType: contentType,
+        durationSeconds: duration?.inSeconds,
       );
-      await Hive.box<VoiceNote>('voice_notes').add(note);
-      print('Voice note added to Hive');
-    } catch (e) {
-      print('Error saving voice note: $e');
+
+      var result = created;
+      try {
+        result = await MediaRepository.instance.rename(mediaId: created.id, title: title);
+      } on ApiException {
+        // The voice note itself is safely uploaded — only the title
+        // failed to save. Same treatment as PHASE14F's _uploadImage: shown
+        // as its own, distinct message rather than a failed upload.
+        if (mounted) {
+          showCustomSnackBar(
+            context,
+            'Voice note uploaded, but its title could not be saved. You can rename it from the menu.',
+            icon: Icons.info_outline,
+          );
+        }
+      }
+
+      if (!mounted) return;
+      setState(() { _remoteVoiceNotes = [result, ..._remoteVoiceNotes]; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyVoiceMediaError(e), icon: Icons.error_outline);
     }
   }
 
@@ -555,40 +702,54 @@ class _VaultPageState extends State<VaultPage> {
                     child: Column(
                       children: [
                         _SearchBar(
+                          // PHASE14G: an imported audio file now uploads to
+                          // the backend via _uploadVoiceNote — it is no
+                          // longer written to Hive. Duration is still
+                          // measured the same pre-existing way
+                          // (AudioPlayer.setSourceDeviceFile(...).
+                          // getDuration()) and forwarded as
+                          // duration_seconds, since that measurement is
+                          // already reliable for an imported file — see the
+                          // PHASE14G implementation report.
                           onAdd: () async {
                             FilePickerResult? result = await FilePicker.platform.pickFiles(
                               type: FileType.custom,
                               allowedExtensions: ['mp3', 'm4a', 'wav', 'aac','opus','ogg'],
                             );
-                            print('File picker result: $result');
                             if (result != null && result.files.single.path != null) {
-                              print('Picked file path: ${result.files.single.path}');
-                              final file = File(result.files.single.path!);
-                              final id = const Uuid().v4();
+                              final path = result.files.single.path!;
+                              final filename = result.files.single.name;
                               final audioPlayer = AudioPlayer();
-                              final duration = await audioPlayer.setSourceDeviceFile(file.path).then((_) => audioPlayer.getDuration());
-                              final note = VoiceNote(
-                                id: id,
-                                title: capitalizeIfNeeded(result.files.single.name),
-                                url: file.path,
-                                localPath: file.path,
-                                date: DateTime.now(),
-                                duration: duration ?? Duration.zero,
+                              final duration = await audioPlayer.setSourceDeviceFile(path).then((_) => audioPlayer.getDuration());
+                              await audioPlayer.dispose();
+                              await _uploadVoiceNote(
+                                path: path,
+                                filename: filename,
+                                title: capitalizeIfNeeded(filename),
+                                duration: duration,
                               );
-                              await Hive.box<VoiceNote>('voice_notes').add(note);
-                              print('Voice note added to Hive from file picker');
                             }
                           },
                           isRecording: _isRecording,
                           onChanged: (v) => setState(() => _voiceNoteSearch = v),
                         ),
                         SizedBox(height: 8),
+                        // PHASE14G: merges backend-hosted voice notes
+                        // (_remoteVoiceNotes) with pre-existing, not-yet-
+                        // migrated Hive voice_notes (_VoiceItem.legacy)
+                        // into one list, newest first — same pattern as
+                        // PHASE14F's image merge.
                         ValueListenableBuilder(
                           valueListenable: Hive.box<VoiceNote>('voice_notes').listenable(),
                           builder: (context, Box<VoiceNote> box, _) {
-                            final notes = box.values.toList().reversed.toList();
-                            final filteredNotes = notes.where((n) => n.title.toLowerCase().contains(_voiceNoteSearch.toLowerCase())).toList();
-                            if (filteredNotes.isEmpty) {
+                            final merged = <_VoiceItem>[
+                              ..._remoteVoiceNotes.map((m) => _VoiceItem.remote(m)),
+                              ...box.values.map((n) => _VoiceItem.legacy(n)),
+                            ]..sort((a, b) => b.date.compareTo(a.date));
+                            final filtered = merged
+                                .where((item) => item.title.toLowerCase().contains(_voiceNoteSearch.toLowerCase()))
+                                .toList();
+                            if (filtered.isEmpty) {
                               return const Padding(
                                 padding: EdgeInsets.symmetric(vertical: 16.0),
                                 child: Center(child: Text('No audio files uploaded')),
@@ -596,13 +757,14 @@ class _VaultPageState extends State<VaultPage> {
                             }
                             return Column(
                               children: [
-                                ...filteredNotes.take(2).map((note) => Padding(
+                                ...filtered.take(2).map((item) => Padding(
+                                  key: ValueKey(item.key),
                                   padding: const EdgeInsets.only(bottom: 8.0),
                                   child: _VoiceNoteItem(
-                                    note: note,
-                                    isPlaying: _currentPlayingId == note.id && _isPlaying,
-                                    onPlay: () => _playVoiceNote(note),
-                                    onMenu: () => _showVoiceNoteMenu(context, note),
+                                    item: item,
+                                    isPlaying: _currentPlayingId == item.key && _isPlaying,
+                                    onPlay: () => _playVoiceNote(item),
+                                    onMenu: () => _showVoiceNoteMenu(context, item),
                                   ),
                                 )),
                               ],
@@ -615,13 +777,26 @@ class _VaultPageState extends State<VaultPage> {
                           children: [
                             _ViewAllButton(
                               onTap: () {
+                                // PHASE14G: same merge as above, snapshotted
+                                // once at navigation time — preserves
+                                // AllVoiceNotesPage's existing "receives a
+                                // static list via its constructor" shape
+                                // (unlike PHASE14F's ViewAllImagesPage,
+                                // which independently reloads its own data)
+                                // rather than redesigning it — see the
+                                // PHASE14G implementation report,
+                                // "Limitations."
+                                final merged = <_VoiceItem>[
+                                  ..._remoteVoiceNotes.map((m) => _VoiceItem.remote(m)),
+                                  ...Hive.box<VoiceNote>('voice_notes').values.map((n) => _VoiceItem.legacy(n)),
+                                ]..sort((a, b) => b.date.compareTo(a.date));
                                 Navigator.push(
                                   context,
                                   MaterialPageRoute(
                                     builder: (context) => AllVoiceNotesPage(
-                                      notes: Hive.box<VoiceNote>('voice_notes').values.toList().reversed.toList(),
-                                      onPlay: (note) => _playVoiceNote(note),
-                                      onMenu: (note) => _showVoiceNoteMenu(context, note),
+                                      notes: merged,
+                                      onPlay: (item) => _playVoiceNote(item),
+                                      onMenu: (item) => _showVoiceNoteMenu(context, item),
                                       currentPlayingId: _currentPlayingId,
                                       isPlaying: _isPlaying,
                                     ),
@@ -933,12 +1108,129 @@ class _SearchBar extends StatelessWidget {
   }
 }
 
+/// PHASE14G: unifies a backend-migrated voice note ([remote]) and a
+/// not-yet-migrated, Hive-only legacy voice note ([legacy]) into one
+/// displayable/playable item — same shape as PHASE14F's `_VaultImage`.
+/// Exactly one of the two is ever non-null. [key] is a stable widget/
+/// playback identity only, never a value sent to the backend.
+class _VoiceItem {
+  const _VoiceItem.remote(MediaAssetModel this.remote) : legacy = null;
+  const _VoiceItem.legacy(VoiceNote this.legacy) : remote = null;
+
+  final MediaAssetModel? remote;
+  final VoiceNote? legacy;
+
+  String get title => legacy?.title ?? remote!.title ?? remote!.originalFilename ?? 'Untitled';
+  DateTime get date => legacy?.date ?? remote!.createdAt;
+  Duration get duration => legacy?.duration ?? Duration(seconds: remote!.durationSeconds ?? 0);
+  String get key => legacy != null ? 'legacy:${legacy!.id}' : 'remote:${remote!.id}';
+}
+
+/// Maps a voice filename's extension to the exact content type the
+/// backend's upload allow-list accepts for voice (PHASE14D audit report,
+/// Section 2; `ALLOWED_CONTENT_TYPES` in
+/// `backend/app/services/media_service.py`). Recordings are always
+/// `.m4a`; imports are restricted by the file picker itself to
+/// `mp3/m4a/wav/aac/opus/ogg` (see the Voice Notes `_SearchBar` below) —
+/// every one of those maps to a real backend-supported type, so `null`
+/// here would only ever occur for a name the picker's own filter should
+/// already have excluded; handled anyway rather than assumed.
+String? voiceContentTypeForFilename(String filename) {
+  final ext = filename.split('.').last.toLowerCase();
+  switch (ext) {
+    case 'm4a':
+      return 'audio/mp4';
+    case 'mp3':
+      return 'audio/mpeg';
+    case 'wav':
+      return 'audio/wav';
+    case 'aac':
+      return 'audio/aac';
+    case 'opus':
+      return 'audio/opus';
+    case 'ogg':
+      return 'audio/ogg';
+    default:
+      return null;
+  }
+}
+
+/// A client-side pre-check only, matching the backend's own default
+/// `max_upload_size_mb = 25` — same rationale as PHASE14F's
+/// `kMaxImageUploadBytes`. Kept as its own, separately-named constant
+/// (not a reuse of `kMaxImageUploadBytes`) so image code is never touched
+/// by this phase.
+const int kMaxVoiceUploadBytes = 25 * 1024 * 1024;
+
+/// Maps a Vault-voice [ApiException] to a short, clean, user-facing
+/// message — same approach as PHASE14F's `_friendlyImageMediaError`.
+String _friendlyVoiceMediaError(ApiException e) {
+  if (e is ValidationException) {
+    return "That voice note couldn't be saved — please check it and try again.";
+  }
+  if (e is NetworkException) {
+    return "Couldn't reach the server. Check your connection and try again.";
+  }
+  if (e is UnauthorizedException) {
+    return 'Your session has expired. Please log in again.';
+  }
+  if (e is NotFoundException) {
+    return 'That voice note could not be found.';
+  }
+  if (e.statusCode == 413) {
+    return 'That voice note is too large (max 25MB).';
+  }
+  if (e.statusCode == 415) {
+    return "That audio file type isn't supported.";
+  }
+  return 'Something went wrong with that voice note. Please try again.';
+}
+
+/// PHASE14G: resolves a fresh presigned download URL via `GET /media/{id}`
+/// and starts playback on [player]. Presigned URLs expire (15 minutes,
+/// PHASE14D audit report, Section 3/4), so this is resolved fresh on every
+/// play, never cached. If playback itself fails on the first attempt
+/// (e.g. the URL had already expired by the time the player requested the
+/// bytes — a race the metadata fetch alone can't detect, since that fetch
+/// succeeding only proves the media exists, not that the signature is
+/// still valid when playback actually starts a moment later), this
+/// re-fetches once and retries exactly once more; a second failure gives
+/// up rather than looping. Shared by both `_VaultPageState` and
+/// `_AllVoiceNotesPageState`, each of which owns its own [AudioPlayer].
+/// Returns `true` iff playback actually started; shows no UI itself —
+/// callers own their own mounted-check and error message.
+Future<bool> _playRemoteVoiceNote(AudioPlayer player, String mediaId) async {
+  Future<String?> resolveUrl() async {
+    try {
+      return (await MediaRepository.instance.get(mediaId)).downloadUrl;
+    } on ApiException {
+      return null;
+    }
+  }
+
+  final url = await resolveUrl();
+  if (url == null) return false;
+  try {
+    await player.play(UrlSource(url));
+    return true;
+  } catch (_) {
+    final retryUrl = await resolveUrl();
+    if (retryUrl == null) return false;
+    try {
+      await player.play(UrlSource(retryUrl));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 class _VoiceNoteItem extends StatelessWidget {
-  final VoiceNote note;
+  final _VoiceItem item;
   final bool isPlaying;
   final VoidCallback onPlay;
   final VoidCallback onMenu;
-  const _VoiceNoteItem({required this.note, required this.isPlaying, required this.onPlay, required this.onMenu});
+  const _VoiceNoteItem({required this.item, required this.isPlaying, required this.onPlay, required this.onMenu});
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -959,16 +1251,16 @@ class _VoiceNoteItem extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  note.title.length > 10
-                      ? note.title.substring(0, 10) + '...'
-                      : note.title,
+                  item.title.length > 10
+                      ? item.title.substring(0, 10) + '...'
+                      : item.title,
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                Text(DateFormat('dd-MM-yy').format(note.date), style: TextStyle(fontSize: 12, color: Colors.grey)),
+                Text(DateFormat('dd-MM-yy').format(item.date), style: TextStyle(fontSize: 12, color: Colors.grey)),
               ],
             ),
           ),
-          Text(_formatDuration(note.duration), style: TextStyle(fontSize: 12, color: Colors.grey)),
+          Text(_formatDuration(item.duration), style: TextStyle(fontSize: 12, color: Colors.grey)),
           SizedBox(width: 6),
           IconButton(
             icon: Icon(Icons.more_vert, color: Colors.grey),
@@ -1287,9 +1579,16 @@ class _ViewAllButton extends StatelessWidget {
 }
 
 class AllVoiceNotesPage extends StatefulWidget {
-  final List<VoiceNote> notes;
-  final Function(VoiceNote) onPlay;
-  final Function(VoiceNote) onMenu;
+  /// PHASE14G: a merged, pre-sorted snapshot of backend + legacy Hive
+  /// voice notes, taken once at navigation time — see the "View All"
+  /// button's `onTap` in `_VaultPageState.build`. Deliberately kept as the
+  /// existing "receives a static list via its constructor" shape (this
+  /// page has never independently queried Hive/the backend itself, unlike
+  /// PHASE14F's `ViewAllImagesPage`) rather than redesigned — see the
+  /// PHASE14G implementation report, "Limitations."
+  final List<_VoiceItem> notes;
+  final Function(_VoiceItem) onPlay;
+  final Function(_VoiceItem) onMenu;
   final String? currentPlayingId;
   final bool isPlaying;
   const AllVoiceNotesPage({
@@ -1317,17 +1616,30 @@ class _AllVoiceNotesPageState extends State<AllVoiceNotesPage> {
     super.dispose();
   }
 
-  void _playVoiceNote(VoiceNote note) async {
-    if (_currentPlayingId == note.id && _isPlaying) {
+  /// PHASE14G: same remote/legacy split as `_VaultPageState._playVoiceNote`
+  /// — this page owns its own [_audioPlayer], so this is its own copy
+  /// rather than a shared instance method (the two `State`s are never
+  /// alive at the same time in a way that could share one).
+  void _playVoiceNote(_VoiceItem item) async {
+    if (_currentPlayingId == item.key && _isPlaying) {
       await _audioPlayer.pause();
       setState(() { _isPlaying = false; });
       return;
     }
     await _audioPlayer.stop();
-    await _audioPlayer.play(DeviceFileSource(note.localPath));
+    if (item.legacy != null) {
+      await _audioPlayer.play(DeviceFileSource(item.legacy!.localPath));
+    } else {
+      final started = await _playRemoteVoiceNote(_audioPlayer, item.remote!.id);
+      if (!started) {
+        if (!mounted) return;
+        showCustomSnackBar(context, "Couldn't play that voice note. Please try again.", icon: Icons.error_outline);
+        return;
+      }
+    }
     setState(() {
       _isPlaying = true;
-      _currentPlayingId = note.id;
+      _currentPlayingId = item.key;
     });
     _audioPlayer.onPlayerComplete.listen((event) {
       setState(() { _isPlaying = false; });
@@ -1392,8 +1704,8 @@ class _AllVoiceNotesPageState extends State<AllVoiceNotesPage> {
                     itemCount: filteredNotes.length,
                     separatorBuilder: (_, __) => SizedBox(height: 8),
                     itemBuilder: (context, i) => _VoiceNoteItem(
-                      note: filteredNotes[i],
-                      isPlaying: _currentPlayingId == filteredNotes[i].id && _isPlaying,
+                      item: filteredNotes[i],
+                      isPlaying: _currentPlayingId == filteredNotes[i].key && _isPlaying,
                       onPlay: () => _playVoiceNote(filteredNotes[i]),
                       onMenu: () => widget.onMenu(filteredNotes[i]),
                     ),
