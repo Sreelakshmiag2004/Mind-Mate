@@ -85,11 +85,20 @@ class _VaultPageState extends State<VaultPage> {
   /// untouched and keep showing up via `_VoiceItem.legacy`.
   List<MediaAssetModel> _remoteVoiceNotes = [];
 
+  /// PHASE14H: this user's backend-hosted videos (`GET /media?media_type=
+  /// video`), newest first — same pattern as [_remoteImages]/
+  /// [_remoteVoiceNotes]. Every item here is guaranteed `video/mp4` (the
+  /// only content type the backend's upload allow-list accepts for video
+  /// — PHASE14D audit report, Section 2), unlike a legacy Hive
+  /// `VideoNote`, whose `path` extension is never actually verified.
+  List<MediaAssetModel> _remoteVideos = [];
+
   @override
   void initState() {
     super.initState();
     _loadRemoteImages();
     _loadRemoteVoiceNotes();
+    _loadRemoteVideos();
   }
 
   /// `GET /media?media_type=voice` via [MediaRepository] — see
@@ -102,6 +111,19 @@ class _VaultPageState extends State<VaultPage> {
     } on ApiException catch (e) {
       if (!mounted) return;
       showCustomSnackBar(context, _friendlyVoiceMediaError(e), icon: Icons.error_outline);
+    }
+  }
+
+  /// `GET /media?media_type=video` via [MediaRepository] — see
+  /// [_remoteVideos]'s own doc.
+  Future<void> _loadRemoteVideos() async {
+    try {
+      final page = await MediaRepository.instance.list(mediaType: 'video', limit: 100, offset: 0);
+      if (!mounted) return;
+      setState(() { _remoteVideos = page.items; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyVideoMediaError(e), icon: Icons.error_outline);
     }
   }
 
@@ -571,6 +593,153 @@ class _VaultPageState extends State<VaultPage> {
     }
   }
 
+  /// PHASE14H video creation — replaces the old direct
+  /// `Hive.box<VideoNote>('video_notes').add(...)` call. Same order of
+  /// operations as PHASE14F/G's `_uploadImage`/`_uploadVoiceNote`: verify
+  /// the file exists -> read bytes -> determine content type -> size
+  /// check -> `POST /media/upload` -> `PATCH` the title -> only then
+  /// considered "created." New videos are no longer written to Hive at
+  /// all. Unlike images/voice, no duration is sent — `VideoNote` itself
+  /// has never had a duration field, and nothing in the existing code
+  /// measures one for a picked video.
+  Future<void> _uploadVideo(String pickedPath, String pickedFilename) async {
+    final file = File(pickedPath);
+    if (!await file.exists()) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't find that video on your device.", icon: Icons.error_outline);
+      return;
+    }
+
+    final contentType = videoContentTypeForFilename(pickedFilename);
+    if (contentType == null) {
+      // PHASE14H: the backend's upload allow-list accepts only
+      // `video/mp4` (PHASE14D audit report, Section 2) — unlike
+      // image/voice, there is no second supported format to fall back to,
+      // so anything else is rejected clearly, before ever attempting an
+      // upload, rather than left to a 415.
+      if (!mounted) return;
+      showCustomSnackBar(context, 'Only MP4 videos can be uploaded right now.', icon: Icons.error_outline);
+      return;
+    }
+
+    final List<int> bytes;
+    try {
+      bytes = await file.readAsBytes();
+    } catch (_) {
+      if (!mounted) return;
+      showCustomSnackBar(context, "Couldn't read that video. Please try again.", icon: Icons.error_outline);
+      return;
+    }
+
+    if (bytes.length > kMaxVideoUploadBytes) {
+      if (!mounted) return;
+      showCustomSnackBar(context, 'That video is too large (max 25MB).', icon: Icons.error_outline);
+      return;
+    }
+
+    try {
+      final created = await MediaRepository.instance.upload(
+        fileBytes: bytes,
+        filename: pickedFilename,
+        contentType: contentType,
+      );
+
+      var result = created;
+      try {
+        result = await MediaRepository.instance.rename(mediaId: created.id, title: capitalizeIfNeeded(pickedFilename));
+      } on ApiException {
+        if (mounted) {
+          showCustomSnackBar(
+            context,
+            'Video uploaded, but its title could not be saved. You can rename it from the menu.',
+            icon: Icons.info_outline,
+          );
+        }
+      }
+
+      if (!mounted) return;
+      setState(() { _remoteVideos = [result, ..._remoteVideos]; });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      showCustomSnackBar(context, _friendlyVideoMediaError(e), icon: Icons.error_outline);
+    }
+  }
+
+  /// PHASE14H rename — [item] may be backend-hosted or a pre-existing
+  /// legacy Hive record; exactly one path runs, never both. Same shape as
+  /// PHASE14F/G's `_renameImage`/`_renameVoiceNote`.
+  Future<void> _renameVideo(_VaultVideo item, String newTitle) async {
+    if (item.remote != null) {
+      try {
+        final updated = await MediaRepository.instance.rename(mediaId: item.remote!.id, title: newTitle);
+        if (!mounted) return;
+        setState(() {
+          _remoteVideos = _remoteVideos.map((m) => m.id == updated.id ? updated : m).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyVideoMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14H behavior.
+    item.legacy!.title = capitalizeIfNeeded(newTitle);
+    await item.legacy!.save();
+  }
+
+  /// PHASE14H delete — same remote/legacy split as [_renameVideo]. A
+  /// legacy item has no reliable backend media id, so it is deleted
+  /// locally exactly as before — same documented limitation as
+  /// PHASE14F/G.
+  Future<void> _deleteVideo(_VaultVideo item) async {
+    if (item.remote != null) {
+      try {
+        await MediaRepository.instance.delete(item.remote!.id);
+        if (!mounted) return;
+        setState(() {
+          _remoteVideos = _remoteVideos.where((m) => m.id != item.remote!.id).toList();
+        });
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        showCustomSnackBar(context, _friendlyVideoMediaError(e), icon: Icons.error_outline);
+      }
+      return;
+    }
+    // Legacy Hive item — unchanged from the pre-PHASE14H behavior (only
+    // removes the Hive record; the underlying file on disk is untouched).
+    await item.legacy!.delete();
+  }
+
+  void _showVideoMenu(BuildContext context, _VaultVideo item) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: Icon(Icons.edit),
+            title: Text('Rename'),
+            onTap: () async {
+              Navigator.pop(context);
+              final newTitle = await _showRenameDialog(context, item.title);
+              if (newTitle != null && newTitle.isNotEmpty) {
+                await _renameVideo(item, newTitle);
+              }
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.delete),
+            title: Text('Delete'),
+            onTap: () async {
+              Navigator.pop(context);
+              await _deleteVideo(item);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -943,32 +1112,37 @@ class _VaultPageState extends State<VaultPage> {
                     child: Column(
                       children: [
                         _SearchBar(
+                          // PHASE14H: a picked video now uploads to the
+                          // backend via _uploadVideo — it is no longer
+                          // written to Hive.
                           onAdd: () async {
                             FilePickerResult? result = await FilePicker.platform.pickFiles(
                               type: FileType.video,
                               allowMultiple: false,
                             );
                             if (result != null && result.files.single.path != null) {
-                              final file = File(result.files.single.path!);
-                              final id = const Uuid().v4();
-                              final note = VideoNote(
-                                id: id,
-                                path: file.path,
-                                title: capitalizeIfNeeded(result.files.single.name),
-                                date: DateTime.now(),
-                              );
-                              await Hive.box<VideoNote>('video_notes').add(note);
+                              await _uploadVideo(result.files.single.path!, result.files.single.name);
                             }
                           },
                           onChanged: (v) => setState(() => _videoSearch = v),
                         ),
                         SizedBox(height: 8),
+                        // PHASE14H: merges backend-hosted videos
+                        // (_remoteVideos) with pre-existing, not-yet-
+                        // migrated Hive video_notes (_VaultVideo.legacy)
+                        // into one list, newest first — same pattern as
+                        // PHASE14F/G's image/voice merge.
                         ValueListenableBuilder(
                           valueListenable: Hive.box<VideoNote>('video_notes').listenable(),
                           builder: (context, Box<VideoNote> box, _) {
-                            final notes = box.values.toList().reversed.toList();
-                            final filteredNotes = notes.where((n) => n.title.toLowerCase().contains(_videoSearch.toLowerCase())).toList();
-                            if (filteredNotes.isEmpty) {
+                            final merged = <_VaultVideo>[
+                              ..._remoteVideos.map((m) => _VaultVideo.remote(m)),
+                              ...box.values.map((n) => _VaultVideo.legacy(n)),
+                            ]..sort((a, b) => b.date.compareTo(a.date));
+                            final filtered = merged
+                                .where((item) => item.title.toLowerCase().contains(_videoSearch.toLowerCase()))
+                                .toList();
+                            if (filtered.isEmpty) {
                               return const Padding(
                                 padding: EdgeInsets.symmetric(vertical: 16.0),
                                 child: Center(child: Text('No videos uploaded')),
@@ -976,11 +1150,12 @@ class _VaultPageState extends State<VaultPage> {
                             }
                             return Column(
                               children: [
-                                ...filteredNotes.take(2).map((note) => Padding(
+                                ...filtered.take(2).map((item) => Padding(
+                                  key: ValueKey(item.key),
                                   padding: const EdgeInsets.only(bottom: 8.0),
                                   child: _VideoListItem(
-                                    note: note,
-                                    onMenu: () => _showVideoMenu(context, note),
+                                    item: item,
+                                    onMenu: () => _showVideoMenu(context, item),
                                   ),
                                 )),
                               ],
@@ -1720,20 +1895,12 @@ class _AllVoiceNotesPageState extends State<AllVoiceNotesPage> {
   }
 }
 
-Future<String?> _showRenameDialog(BuildContext context, String currentTitle) async {
-  final controller = TextEditingController(text: currentTitle);
-  return showDialog<String>(
-    context: context,
-    builder: (context) => AlertDialog(
-      title: Text('Rename'),
-      content: TextField(controller: controller),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: Text('Cancel')),
-        TextButton(onPressed: () => Navigator.pop(context, controller.text), child: Text('Rename')),
-      ],
-    ),
-  );
-}
+// PHASE14H: the standalone top-level `_showRenameDialog` that used to live
+// here was only ever called by the old top-level `_showVideoMenu`; now
+// that `_showVideoMenu` is a `_VaultPageState` instance method (needed so
+// Rename/Delete can call `setState` — see that method's own doc), it
+// resolves to `_VaultPageState._showRenameDialog` instead, and this
+// duplicate became dead code. Removed rather than left orphaned.
 
 @HiveType(typeId: 0)
 class VoiceNote extends HiveObject {
@@ -1779,8 +1946,29 @@ class VoiceNote extends HiveObject {
 }
 
 class VideoPlayerDialog extends StatefulWidget {
-  final String videoPath;
-  const VideoPlayerDialog({Key? key, required this.videoPath}) : super(key: key);
+  /// A local legacy Hive video's path. Exactly one of [videoPath]/
+  /// [networkUrl] must be given (PHASE14H).
+  final String? videoPath;
+
+  /// A backend video's freshly-resolved presigned `download_url`
+  /// (`MediaRepository.get(id)`), already obtained by the caller before
+  /// opening this dialog.
+  final String? networkUrl;
+
+  /// PHASE14H: called at most once, only for a [networkUrl] source, if
+  /// the first playback attempt fails — presigned URLs expire (PHASE14D
+  /// audit report, Section 3/4), so a failure may just mean the one this
+  /// dialog was opened with already had. Should return a freshly-resolved
+  /// `download_url` (typically another `MediaRepository.get(id)` call),
+  /// or `null` if that itself fails. `null` for a legacy [videoPath].
+  final Future<String?> Function()? onExpiredUrl;
+
+  const VideoPlayerDialog({Key? key, this.videoPath, this.networkUrl, this.onExpiredUrl})
+      : assert(
+          (videoPath == null) != (networkUrl == null),
+          'exactly one of videoPath/networkUrl must be given',
+        ),
+        super(key: key);
 
   @override
   _VideoPlayerDialogState createState() => _VideoPlayerDialogState();
@@ -1790,7 +1978,15 @@ class _VideoPlayerDialogState extends State<VideoPlayerDialog> {
   late VideoPlayerController _controller;
   bool _isInitialized = false;
   bool _isMuted = false;
+  bool _failed = false;
+  bool _hasRetried = false;
   int _rotationTurns = 0;
+
+  /// The network URL currently backing [_controller] — starts as
+  /// [VideoPlayerDialog.networkUrl] and is replaced with a freshly-
+  /// resolved one after a single retry (see [_initialize]). `null` for a
+  /// local [VideoPlayerDialog.videoPath].
+  String? _currentNetworkUrl;
 
   String _formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
@@ -1804,6 +2000,7 @@ class _VideoPlayerDialogState extends State<VideoPlayerDialog> {
       MaterialPageRoute(
         builder: (_) => FullscreenVideoPlayerPage(
           videoPath: widget.videoPath,
+          networkUrl: _currentNetworkUrl,
           initialRotation: _rotationTurns,
         ),
       ),
@@ -1815,13 +2012,40 @@ class _VideoPlayerDialogState extends State<VideoPlayerDialog> {
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.file(File(widget.videoPath))
-      ..initialize().then((_) {
-        setState(() {
-          _isInitialized = true;
-        });
-        _controller.play();
-      });
+    _currentNetworkUrl = widget.networkUrl;
+    _controller = _currentNetworkUrl != null
+        ? VideoPlayerController.networkUrl(Uri.parse(_currentNetworkUrl!))
+        : VideoPlayerController.file(File(widget.videoPath!));
+    _initialize();
+  }
+
+  /// PHASE14H: for a [VideoPlayerDialog.networkUrl] source, a failed
+  /// first attempt triggers exactly one [VideoPlayerDialog.onExpiredUrl]
+  /// re-fetch-and-retry; a second failure (or a local [videoPath], which
+  /// never retries — a missing local file isn't something re-fetching a
+  /// URL could fix) shows an error state rather than spinning forever.
+  Future<void> _initialize() async {
+    try {
+      await _controller.initialize();
+      if (!mounted) return;
+      setState(() { _isInitialized = true; });
+      _controller.play();
+    } catch (_) {
+      if (_currentNetworkUrl != null && widget.onExpiredUrl != null && !_hasRetried) {
+        _hasRetried = true;
+        final freshUrl = await widget.onExpiredUrl!();
+        await _controller.dispose();
+        if (freshUrl == null) {
+          if (mounted) setState(() { _failed = true; });
+          return;
+        }
+        _currentNetworkUrl = freshUrl;
+        _controller = VideoPlayerController.networkUrl(Uri.parse(freshUrl));
+        await _initialize();
+        return;
+      }
+      if (mounted) setState(() { _failed = true; });
+    }
   }
 
   @override
@@ -1836,7 +2060,15 @@ class _VideoPlayerDialogState extends State<VideoPlayerDialog> {
       builder: (context, orientation) {
         return AlertDialog(
           backgroundColor: Colors.black,
-          content: _isInitialized
+          content: _failed
+              ? const SizedBox(
+                  width: 220,
+                  height: 100,
+                  child: Center(
+                    child: Text("Couldn't play this video.", style: TextStyle(color: Colors.white)),
+                  ),
+                )
+              : _isInitialized
               ? Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -1915,9 +2147,21 @@ class _VideoPlayerDialogState extends State<VideoPlayerDialog> {
 }
 
 class FullscreenVideoPlayerPage extends StatefulWidget {
-  final String videoPath;
+  /// A local legacy Hive video's path. Exactly one of [videoPath]/
+  /// [networkUrl] must be given (PHASE14H). Reached only from
+  /// [VideoPlayerDialog]'s own fullscreen button, after that dialog's
+  /// controller already initialized successfully — so, unlike
+  /// [VideoPlayerDialog] itself, this page does not separately retry an
+  /// expired URL; it simply reuses whatever source is already working.
+  final String? videoPath;
+  final String? networkUrl;
   final int initialRotation;
-  const FullscreenVideoPlayerPage({Key? key, required this.videoPath, this.initialRotation = 0}) : super(key: key);
+  const FullscreenVideoPlayerPage({Key? key, this.videoPath, this.networkUrl, this.initialRotation = 0})
+      : assert(
+          (videoPath == null) != (networkUrl == null),
+          'exactly one of videoPath/networkUrl must be given',
+        ),
+        super(key: key);
 
   @override
   State<FullscreenVideoPlayerPage> createState() => _FullscreenVideoPlayerPageState();
@@ -1940,13 +2184,16 @@ class _FullscreenVideoPlayerPageState extends State<FullscreenVideoPlayerPage> {
   void initState() {
     super.initState();
     _rotationTurns = widget.initialRotation;
-    _controller = VideoPlayerController.file(File(widget.videoPath))
-      ..initialize().then((_) {
-        setState(() {
-          _isInitialized = true;
-        });
-        _controller.play();
+    _controller = widget.networkUrl != null
+        ? VideoPlayerController.networkUrl(Uri.parse(widget.networkUrl!))
+        : VideoPlayerController.file(File(widget.videoPath!));
+    _controller.initialize().then((_) {
+      if (!mounted) return;
+      setState(() {
+        _isInitialized = true;
       });
+      _controller.play();
+    });
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
   }
 
@@ -2037,12 +2284,122 @@ class _FullscreenVideoPlayerPageState extends State<FullscreenVideoPlayerPage> {
   }
 }
 
+/// PHASE14H: unifies a backend-migrated video ([remote]) and a not-yet-
+/// migrated, Hive-only legacy video ([legacy]) into one displayable item
+/// — same shape as PHASE14F/G's `_VaultImage`/`_VoiceItem`. Named
+/// `_VaultVideo` rather than `_VideoItem`: this file already has an
+/// existing, unrelated (and already-dead — see PHASE14D audit report,
+/// Section 1) `_VideoItem` widget class, so that name was avoided rather
+/// than colliding with it. Exactly one of [remote]/[legacy] is ever
+/// non-null.
+///
+/// A [remote] item is guaranteed `video/mp4` — the only content type the
+/// backend's upload allow-list accepts for video (PHASE14D audit report,
+/// Section 2) — so [_VideoListItem] never needs the legacy
+/// `path.endsWith('.mp4')` sniff for it; that pre-existing check (and its
+/// documented mis-render for a non-`.mp4` legacy path) is left completely
+/// unchanged for [legacy] items — see the PHASE14H implementation report,
+/// "Important existing bug."
+class _VaultVideo {
+  const _VaultVideo.remote(MediaAssetModel this.remote) : legacy = null;
+  const _VaultVideo.legacy(VideoNote this.legacy) : remote = null;
+
+  final MediaAssetModel? remote;
+  final VideoNote? legacy;
+
+  String get title => legacy?.title ?? remote!.title ?? remote!.originalFilename ?? 'Untitled';
+  DateTime get date => legacy?.date ?? remote!.createdAt;
+  String get key => legacy != null ? 'legacy:${legacy!.id}' : 'remote:${remote!.id}';
+}
+
+/// Maps a video filename's extension to the exact content type the
+/// backend's upload allow-list accepts — today just `video/mp4`
+/// (PHASE14D audit report, Section 2; `ALLOWED_CONTENT_TYPES` in
+/// `backend/app/services/media_service.py`). The existing picker
+/// (`FileType.video`) is a broad OS-level filter that can return other
+/// container formats; anything other than `.mp4` returns `null` here and
+/// is rejected before ever attempting an upload — see `_uploadVideo`.
+String? videoContentTypeForFilename(String filename) {
+  final ext = filename.split('.').last.toLowerCase();
+  if (ext == 'mp4') return 'video/mp4';
+  return null;
+}
+
+/// A client-side pre-check only, matching the backend's own default
+/// `max_upload_size_mb = 25` — same rationale as PHASE14F/G's
+/// `kMaxImageUploadBytes`/`kMaxVoiceUploadBytes`. Its own, separately-
+/// named constant so image/voice code is never touched by this phase.
+const int kMaxVideoUploadBytes = 25 * 1024 * 1024;
+
+/// Maps a Vault-video [ApiException] to a short, clean, user-facing
+/// message — same approach as PHASE14F/G's `_friendlyImageMediaError`/
+/// `_friendlyVoiceMediaError`.
+String _friendlyVideoMediaError(ApiException e) {
+  if (e is ValidationException) {
+    return "That video couldn't be saved — please check it and try again.";
+  }
+  if (e is NetworkException) {
+    return "Couldn't reach the server. Check your connection and try again.";
+  }
+  if (e is UnauthorizedException) {
+    return 'Your session has expired. Please log in again.';
+  }
+  if (e is NotFoundException) {
+    return 'That video could not be found.';
+  }
+  if (e.statusCode == 413) {
+    return 'That video is too large (max 25MB).';
+  }
+  if (e.statusCode == 415) {
+    return 'Only MP4 videos can be uploaded right now.';
+  }
+  return 'Something went wrong with that video. Please try again.';
+}
+
 class _VideoListItem extends StatelessWidget {
-  final VideoNote note;
+  final _VaultVideo item;
   final VoidCallback onMenu;
-  const _VideoListItem({required this.note, required this.onMenu});
+  const _VideoListItem({required this.item, required this.onMenu});
+
+  /// PHASE14H: resolves a fresh presigned `download_url` via
+  /// `MediaRepository.get(id)` and opens [VideoPlayerDialog] with it,
+  /// passing an `onExpiredUrl` callback that re-resolves the same way for
+  /// that dialog's own single retry. On a resolution failure, shows a
+  /// snackbar rather than opening a dialog that could never play anything.
+  Future<void> _openRemoteVideo(BuildContext context) async {
+    final mediaId = item.remote!.id;
+    String? url;
+    try {
+      url = (await MediaRepository.instance.get(mediaId)).downloadUrl;
+    } on ApiException catch (e) {
+      if (!context.mounted) return;
+      showCustomSnackBar(context, _friendlyVideoMediaError(e), icon: Icons.error_outline);
+      return;
+    }
+    if (url == null) {
+      if (!context.mounted) return;
+      showCustomSnackBar(context, "Couldn't play that video. Please try again.", icon: Icons.error_outline);
+      return;
+    }
+    if (!context.mounted) return;
+    showDialog(
+      context: context,
+      builder: (_) => VideoPlayerDialog(
+        networkUrl: url,
+        onExpiredUrl: () async {
+          try {
+            return (await MediaRepository.instance.get(mediaId)).downloadUrl;
+          } on ApiException {
+            return null;
+          }
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final legacy = item.legacy;
     return Container(
       padding: EdgeInsets.symmetric(vertical: 8, horizontal: 12),
       decoration: BoxDecoration(
@@ -2053,10 +2410,18 @@ class _VideoListItem extends StatelessWidget {
         children: [
           GestureDetector(
             onTap: () {
-              if (note.path.endsWith('.mp4')) {
+              if (legacy == null) {
+                _openRemoteVideo(context);
+                return;
+              }
+              // Legacy Hive item — unchanged from the pre-PHASE14H
+              // behavior, including its pre-existing `.mp4`-only
+              // video-vs-image-fallback sniff (see this file's own
+              // `_VaultVideo` doc).
+              if (legacy.path.endsWith('.mp4')) {
                 showDialog(
                   context: context,
-                  builder: (_) => VideoPlayerDialog(videoPath: note.path),
+                  builder: (_) => VideoPlayerDialog(videoPath: legacy.path),
                 );
               } else {
                 showDialog(
@@ -2071,7 +2436,7 @@ class _VideoListItem extends StatelessWidget {
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(16),
                         child: Image.file(
-                          File(note.path),
+                          File(legacy.path),
                           fit: BoxFit.contain,
                         ),
                       ),
@@ -2082,38 +2447,52 @@ class _VideoListItem extends StatelessWidget {
             },
             child: ClipRRect(
               borderRadius: BorderRadius.circular(8),
-              child: note.path.endsWith('.mp4')
-                ? FutureBuilder<Uint8List?>(
-                    future: VideoThumbnail.thumbnailData(
-                      video: note.path,
-                      imageFormat: ImageFormat.PNG,
-                      maxWidth: 128,
-                      quality: 75,
+              child: legacy == null
+                  // PHASE14H: a remote item is always video/mp4 — no
+                  // extension sniff needed — but, per the PHASE14D audit's
+                  // own deferred decision (Section 9), generating a real
+                  // thumbnail from a remote URL is out of scope for this
+                  // phase; shown as the same static fallback icon the
+                  // legacy path already uses while its own thumbnail is
+                  // still loading, not a fetched image.
+                  ? Container(
+                      width: 48,
+                      height: 48,
+                      color: Colors.black12,
+                      child: Icon(Icons.videocam, color: Colors.grey, size: 32),
+                    )
+                  : legacy.path.endsWith('.mp4')
+                  ? FutureBuilder<Uint8List?>(
+                      future: VideoThumbnail.thumbnailData(
+                        video: legacy.path,
+                        imageFormat: ImageFormat.PNG,
+                        maxWidth: 128,
+                        quality: 75,
+                      ),
+                      builder: (context, snapshot) {
+                        if (snapshot.connectionState == ConnectionState.done && snapshot.data != null) {
+                          return Image.memory(
+                            snapshot.data!,
+                            width: 48,
+                            height: 48,
+                            fit: BoxFit.cover,
+                          );
+                        } else {
+                          return Container(
+                            width: 48,
+                            height: 48,
+                            color: Colors.black12,
+                            child: Icon(Icons.videocam, color: Colors.grey, size: 32),
+                          );
+                        }
+                      },
+                    )
+                  : Image.file(
+                      File(legacy.path),
+                      width: 48,
+                      height: 48,
+                      fit: BoxFit.cover,
                     ),
-                    builder: (context, snapshot) {
-                      if (snapshot.connectionState == ConnectionState.done && snapshot.data != null) {
-                        return Image.memory(
-                          snapshot.data!,
-                          width: 48,
-                          height: 48,
-                          fit: BoxFit.cover,
-                        );
-                      } else {
-                        return Container(
-                          width: 48,
-                          height: 48,
-                          color: Colors.black12,
-                          child: Icon(Icons.videocam, color: Colors.grey, size: 32),
-                        );
-                      }
-                    },
-                  )
-                : Image.file(
-                    File(note.path),
-                    width: 48,
-                    height: 48,
-                    fit: BoxFit.cover,
-                  ),
             ),
           ),
           SizedBox(width: 10),
@@ -2122,11 +2501,11 @@ class _VideoListItem extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  note.title.length > 10 ? note.title.substring(0, 10) + '...' : note.title,
+                  item.title.length > 10 ? item.title.substring(0, 10) + '...' : item.title,
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
                 Text(
-                  '${note.date.day.toString().padLeft(2, '0')}-${note.date.month.toString().padLeft(2, '0')}-${note.date.year}',
+                  '${item.date.day.toString().padLeft(2, '0')}-${item.date.month.toString().padLeft(2, '0')}-${item.date.year}',
                   style: TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ],
@@ -2141,37 +2520,6 @@ class _VideoListItem extends StatelessWidget {
       ),
     );
   }
-}
-
-void _showVideoMenu(BuildContext context, VideoNote note) {
-  showModalBottomSheet(
-    context: context,
-    builder: (context) => Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        ListTile(
-          leading: Icon(Icons.edit),
-          title: Text('Rename'),
-          onTap: () async {
-            Navigator.pop(context);
-            final newTitle = await _showRenameDialog(context, note.title);
-            if (newTitle != null && newTitle.isNotEmpty) {
-              note.title = newTitle;
-              await note.save();
-            }
-          },
-        ),
-        ListTile(
-          leading: Icon(Icons.delete),
-          title: Text('Delete'),
-          onTap: () async {
-            Navigator.pop(context);
-            await note.delete();
-          },
-        ),
-      ],
-    ),
-  );
 }
 
 // Utility function to capitalize first letter if not numeric
