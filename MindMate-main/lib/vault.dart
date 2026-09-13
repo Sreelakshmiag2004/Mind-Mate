@@ -31,6 +31,10 @@ import 'core/network/api_exception.dart';
 import 'data/models/media/media_asset_model.dart';
 import 'data/repositories/media_repository.dart';
 import 'custom_snackbar.dart';
+// PHASE14I-D: the Vault header's "migrate to cloud" button (see below)
+// pushes this route. Nothing else in vault.dart references it — no
+// migration logic is duplicated here, only the navigation call.
+import 'legacy_media_migration_page.dart';
 part 'vault.g.dart';
 
 class VaultPage extends StatefulWidget {
@@ -838,6 +842,23 @@ class _VaultPageState extends State<VaultPage> {
                           ),
                         ),
                         Spacer(),
+                        // PHASE14I-D: the entry point into the legacy Hive
+                        // media migration screen — user-triggered only
+                        // (nothing above this button ever navigates here on
+                        // its own). See legacy_media_migration_page.dart;
+                        // this button does nothing but push that route —
+                        // no migration logic lives here.
+                        IconButton(
+                          key: const Key('migrateVaultButton'),
+                          icon: Icon(Icons.cloud_upload_outlined, color: Colors.black87),
+                          tooltip: 'Migrate legacy media to cloud',
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (context) => LegacyMediaMigrationPage()),
+                            );
+                          },
+                        ),
                         Container(
                           padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                           decoration: BoxDecoration(

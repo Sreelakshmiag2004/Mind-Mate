@@ -36,6 +36,8 @@ class MediaAssetModel {
     required this.fileSize,
     this.durationSeconds,
     required this.createdAt,
+    this.legacySource,
+    this.legacyCreatedAt,
     this.downloadUrl,
     this.downloadUrlExpiresInSeconds,
   });
@@ -68,6 +70,26 @@ class MediaAssetModel {
 
   final DateTime createdAt;
 
+  /// PHASE14I-C. Mirrors the backend's `MediaAssetRead.legacy_source`
+  /// (PHASE14I-B) — `"<image|voice|video>:<legacy-hive-id>"` when this
+  /// item was created by [LegacyMediaMigrationService], `null` for every
+  /// ordinary upload (which is every item before this phase, and the
+  /// overwhelming majority of items after it). Decoded because the
+  /// migration runner's own duplicate-check (`GET /media?legacy_source=
+  /// ...`) needs to read it back to confirm which Hive record a returned
+  /// asset already corresponds to — not merely because the backend
+  /// happens to include it.
+  final String? legacySource;
+
+  /// PHASE14I-C. Mirrors the backend's `MediaAssetRead.legacy_created_at`
+  /// — the preserved original Hive `DateTime`, when this is a migrated
+  /// item; `null` otherwise. Deliberately never used in place of
+  /// [createdAt] by anything in this model itself — a future Vault
+  /// screen decides which one to display (see the backend's own
+  /// `MediaAssetRead` doc for the same guidance: `legacyCreatedAt` is a
+  /// migrated note's real date, `createdAt` is migration time).
+  final DateTime? legacyCreatedAt;
+
   /// Non-null only when this was parsed from `GET /media/{id}`'s
   /// `MediaAssetDetail` response — a time-limited URL the client can use
   /// to fetch the object's bytes directly, bypassing this API. Never a
@@ -92,8 +114,13 @@ class MediaAssetModel {
       fileSize: json['file_size'] as int,
       durationSeconds: json['duration_seconds'] as int?,
       createdAt: DateTime.parse(json['created_at'] as String),
+      legacySource: json['legacy_source'] as String?,
+      legacyCreatedAt: json['legacy_created_at'] != null
+          ? DateTime.parse(json['legacy_created_at'] as String)
+          : null,
       downloadUrl: json['download_url'] as String?,
-      downloadUrlExpiresInSeconds: json['download_url_expires_in_seconds'] as int?,
+      downloadUrlExpiresInSeconds:
+          json['download_url_expires_in_seconds'] as int?,
     );
   }
 
@@ -106,8 +133,12 @@ class MediaAssetModel {
     'file_size': fileSize,
     'duration_seconds': durationSeconds,
     'created_at': createdAt.toIso8601String(),
+    'legacy_source': legacySource,
+    if (legacyCreatedAt != null)
+      'legacy_created_at': legacyCreatedAt!.toIso8601String(),
     if (downloadUrl != null) 'download_url': downloadUrl,
-    if (downloadUrlExpiresInSeconds != null) 'download_url_expires_in_seconds': downloadUrlExpiresInSeconds,
+    if (downloadUrlExpiresInSeconds != null)
+      'download_url_expires_in_seconds': downloadUrlExpiresInSeconds,
   };
 }
 
@@ -121,7 +152,12 @@ class MediaAssetModel {
 /// own instruction not to hard-code pagination behavior that differs from
 /// it.
 class MediaAssetPage {
-  const MediaAssetPage({required this.items, required this.total, required this.limit, required this.offset});
+  const MediaAssetPage({
+    required this.items,
+    required this.total,
+    required this.limit,
+    required this.offset,
+  });
 
   final List<MediaAssetModel> items;
   final int total;
@@ -131,7 +167,9 @@ class MediaAssetPage {
   factory MediaAssetPage.fromJson(Map<String, dynamic> json) {
     final items = json['items'] as List<dynamic>? ?? const [];
     return MediaAssetPage(
-      items: items.map((item) => MediaAssetModel.fromJson(item as Map<String, dynamic>)).toList(),
+      items: items
+          .map((item) => MediaAssetModel.fromJson(item as Map<String, dynamic>))
+          .toList(),
       total: json['total'] as int,
       limit: json['limit'] as int,
       offset: json['offset'] as int,

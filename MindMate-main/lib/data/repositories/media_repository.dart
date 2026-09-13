@@ -20,7 +20,8 @@ import '../models/media/media_asset_model.dart';
 /// backend identifier, either — every method below works purely in bytes,
 /// ids, and [MediaAssetModel]/[MediaAssetPage].
 class MediaRepository {
-  MediaRepository({ApiClient? apiClient}) : _apiClient = apiClient ?? ApiClient();
+  MediaRepository({ApiClient? apiClient})
+    : _apiClient = apiClient ?? ApiClient();
 
   /// Lazily-constructed app-wide singleton, matching
   /// `VaultLockRepository.instance`/`ShoutoutRepository.instance`. Tests
@@ -37,24 +38,46 @@ class MediaRepository {
   /// `null`, matching the backend's own "client-reported, display-only"
   /// treatment of it (PHASE14D audit report, Section 2).
   ///
+  /// [legacySource]/[legacyCreatedAt] (PHASE14I-C) are the two fields
+  /// [LegacyMediaMigrationService] sends for a legacy Hive migration
+  /// upload — see `backend/app/schemas/media.py`'s `MediaUploadLegacyFields`
+  /// for the exact contract. Both omitted entirely when `null`, exactly
+  /// like [durationSeconds] above, so a normal (non-legacy) upload's
+  /// request body is byte-for-byte unchanged from before this phase.
+  /// [legacyCreatedAt] is sent as `.toUtc().toIso8601String()` — never the
+  /// raw (possibly local-time) value — because the backend cannot safely
+  /// reinterpret a naive datetime string itself (PHASE14I-B implementation
+  /// report, "Timezone/date handling"); converting here, once, is what
+  /// lets every caller (today, only [LegacyMediaMigrationService]) hand
+  /// this a plain Hive `DateTime` without repeating that conversion.
+  ///
   /// An unsupported [contentType] surfaces as the backend's 415 (mapped by
   /// [ApiClient]/[ApiException] to [UnknownApiException], same as any
-  /// other unmapped status), an oversized [fileBytes] as its 413 — this
-  /// repository invents no second exception system, per this phase's own
-  /// instruction; every failure goes through the existing [ApiException]
-  /// hierarchy exactly like every other repository in the app.
+  /// other unmapped status), an oversized [fileBytes] as its 413, a blank/
+  /// malformed [legacySource] or invalid [legacyCreatedAt] as its 422 (via
+  /// [ValidationException]) — this repository invents no second exception
+  /// system, per this phase's own instruction; every failure goes through
+  /// the existing [ApiException] hierarchy exactly like every other
+  /// repository in the app.
   Future<MediaAssetModel> upload({
     required List<int> fileBytes,
     required String filename,
     required String contentType,
     int? durationSeconds,
+    String? legacySource,
+    DateTime? legacyCreatedAt,
   }) async {
     final body = await _apiClient.uploadMultipart(
       ApiEndpoints.mediaUpload,
       fileBytes: fileBytes,
       filename: filename,
       contentType: contentType,
-      fields: {if (durationSeconds != null) 'duration_seconds': durationSeconds},
+      fields: {
+        if (durationSeconds != null) 'duration_seconds': durationSeconds,
+        if (legacySource != null) 'legacy_source': legacySource,
+        if (legacyCreatedAt != null)
+          'legacy_created_at': legacyCreatedAt.toUtc().toIso8601String(),
+      },
     );
     return MediaAssetModel.fromJson(body!);
   }
@@ -67,10 +90,28 @@ class MediaRepository {
   /// this repository does not re-validate it client-side, so an invalid
   /// value surfaces as the backend's own 422 via [ApiException], not a
   /// silent local rejection.
-  Future<MediaAssetPage> list({String? mediaType, int limit = 30, int offset = 0}) async {
+  ///
+  /// [legacySource] (PHASE14I-C), when given, is the exact-match
+  /// `legacy_source` lookup filter [LegacyMediaMigrationService] uses to
+  /// ask "has this Hive record already been migrated?" without any local
+  /// migration-status store of its own — see `backend/app/api/routes/
+  /// media.py`'s `GET /media?legacy_source=...`. Omitted entirely when
+  /// `null`, exactly like [mediaType], so a normal listing call is
+  /// unaffected.
+  Future<MediaAssetPage> list({
+    String? mediaType,
+    String? legacySource,
+    int limit = 30,
+    int offset = 0,
+  }) async {
     final body = await _apiClient.get(
       ApiEndpoints.media,
-      queryParameters: {if (mediaType != null) 'media_type': mediaType, 'limit': limit, 'offset': offset},
+      queryParameters: {
+        if (mediaType != null) 'media_type': mediaType,
+        if (legacySource != null) 'legacy_source': legacySource,
+        'limit': limit,
+        'offset': offset,
+      },
     );
     return MediaAssetPage.fromJson(body!);
   }
@@ -93,8 +134,14 @@ class MediaRepository {
   /// blank/whitespace-only or over-200-character [title], and
   /// [NotFoundException] (404) if [mediaId] doesn't exist or isn't this
   /// user's.
-  Future<MediaAssetModel> rename({required String mediaId, required String title}) async {
-    final body = await _apiClient.patch(ApiEndpoints.mediaById(mediaId), data: {'title': title});
+  Future<MediaAssetModel> rename({
+    required String mediaId,
+    required String title,
+  }) async {
+    final body = await _apiClient.patch(
+      ApiEndpoints.mediaById(mediaId),
+      data: {'title': title},
+    );
     return MediaAssetModel.fromJson(body!);
   }
 
