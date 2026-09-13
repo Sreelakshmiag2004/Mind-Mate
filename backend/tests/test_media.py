@@ -1,5 +1,6 @@
 import io
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -386,3 +387,419 @@ def test_upload_media_cleans_up_orphaned_object_on_db_failure(db_session, storag
         )
 
     assert storage.count() == 0  # cleaned up, not orphaned
+
+
+# --- PHASE14I-B: legacy Hive media migration duplicate-safe tracking ---
+
+
+def test_normal_upload_has_null_legacy_fields(client: TestClient):
+    headers = register_and_get_headers(client, "legacy1@example.com")
+
+    response = _upload(client, headers)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["legacy_source"] is None
+    assert body["legacy_created_at"] is None
+
+
+def test_normal_upload_with_legacy_created_at_omitted_succeeds(client: TestClient):
+    """A legacy_source with no legacy_created_at is a valid, independent combination."""
+    headers = register_and_get_headers(client, "legacy2@example.com")
+
+    response = _upload(client, headers, legacy_source="image:no-date")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["legacy_source"] == "image:no-date"
+    assert body["legacy_created_at"] is None
+
+
+def test_legacy_upload_with_valid_legacy_source_succeeds(client: TestClient):
+    headers = register_and_get_headers(client, "legacy3@example.com")
+
+    response = _upload(client, headers, legacy_source="image:abc")
+
+    assert response.status_code == 201
+    assert response.json()["legacy_source"] == "image:abc"
+
+
+def test_legacy_upload_with_valid_legacy_created_at_round_trips_as_utc(client: TestClient):
+    headers = register_and_get_headers(client, "legacy4@example.com")
+
+    response = _upload(
+        client, headers, legacy_source="image:legacy-date", legacy_created_at="2020-06-15T10:30:00+05:30"
+    )
+
+    assert response.status_code == 201
+    # The service layer normalizes to a tz-AWARE UTC datetime before this
+    # ever reaches the database (see MediaUploadLegacyFields._normalize_to_utc
+    # and app/models/media_asset.py) — what's asserted below (the naive
+    # wall-clock value) is what actually round-trips back out through the
+    # test suite's SQLite fallback, which does not preserve a `tzinfo` on
+    # read-back the way PostgreSQL's real timestamptz does (see
+    # tests/conftest.py's documented Phase 1 SQLite-vs-PostgreSQL
+    # trade-off). Comparing wall-clock value here still proves the +05:30
+    # offset was correctly converted to UTC before storage.
+    returned = datetime.fromisoformat(response.json()["legacy_created_at"])
+    assert returned.replace(tzinfo=None) == datetime(2020, 6, 15, 5, 0, 0)  # +05:30 normalized to UTC
+
+
+def test_legacy_created_at_naive_value_is_assumed_utc(client: TestClient):
+    """See MediaUploadLegacyFields._normalize_to_utc's docstring: a value with no offset is stamped UTC, not rejected."""
+    headers = register_and_get_headers(client, "legacy4b@example.com")
+
+    response = _upload(client, headers, legacy_source="image:naive-date", legacy_created_at="2020-06-15T10:30:00")
+
+    assert response.status_code == 201
+    returned = datetime.fromisoformat(response.json()["legacy_created_at"])
+    assert returned.replace(tzinfo=None) == datetime(2020, 6, 15, 10, 30, 0)
+
+
+def test_duplicate_legacy_source_returns_existing_asset(client: TestClient):
+    headers = register_and_get_headers(client, "legacy5@example.com")
+    first = _upload(client, headers, legacy_source="image:dup").json()
+
+    second = _upload(client, headers, filename="different.png", content=b"other bytes", legacy_source="image:dup")
+
+    assert second.status_code == 201
+    assert second.json()["id"] == first["id"]
+
+
+def test_duplicate_legacy_source_does_not_create_second_db_row(client: TestClient):
+    headers = register_and_get_headers(client, "legacy6@example.com")
+    _upload(client, headers, legacy_source="image:dup2")
+
+    _upload(client, headers, legacy_source="image:dup2")
+
+    assert client.get("/media", headers=headers).json()["total"] == 1
+
+
+def test_duplicate_legacy_source_does_not_create_second_storage_object(client: TestClient, storage):
+    headers = register_and_get_headers(client, "legacy7@example.com")
+    _upload(client, headers, legacy_source="image:dup3")
+    assert storage.count() == 1
+
+    _upload(client, headers, legacy_source="image:dup3")
+
+    assert storage.count() == 1
+
+
+def test_different_legacy_source_creates_different_assets(client: TestClient):
+    headers = register_and_get_headers(client, "legacy8@example.com")
+    first = _upload(client, headers, legacy_source="image:one").json()
+
+    second = _upload(client, headers, legacy_source="image:two").json()
+
+    assert first["id"] != second["id"]
+    assert client.get("/media", headers=headers).json()["total"] == 2
+
+
+def test_same_legacy_source_allowed_for_different_users(client: TestClient):
+    headers_a = register_and_get_headers(client, "legacy9a@example.com")
+    headers_b = register_and_get_headers(client, "legacy9b@example.com")
+
+    response_a = _upload(client, headers_a, legacy_source="image:shared")
+    response_b = _upload(client, headers_b, legacy_source="image:shared")
+
+    assert response_a.status_code == 201
+    assert response_b.status_code == 201
+    assert response_a.json()["id"] != response_b.json()["id"]
+
+
+def test_user_cannot_query_another_users_legacy_source(client: TestClient):
+    owner_headers = register_and_get_headers(client, "legacy10owner@example.com")
+    other_headers = register_and_get_headers(client, "legacy10other@example.com")
+    _upload(client, owner_headers, legacy_source="image:owned")
+
+    response = client.get("/media", params={"legacy_source": "image:owned"}, headers=other_headers)
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+
+
+def test_owner_can_query_own_legacy_source(client: TestClient):
+    headers = register_and_get_headers(client, "legacy11@example.com")
+    created = _upload(client, headers, legacy_source="image:findme").json()
+
+    response = client.get("/media", params={"legacy_source": "image:findme"}, headers=headers)
+
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["id"] == created["id"]
+
+
+def test_query_for_absent_legacy_source_returns_empty(client: TestClient):
+    headers = register_and_get_headers(client, "legacy12@example.com")
+
+    response = client.get("/media", params={"legacy_source": "image:never-uploaded"}, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
+
+
+def test_blank_legacy_source_rejected(client: TestClient):
+    headers = register_and_get_headers(client, "legacy13@example.com")
+
+    response = _upload(client, headers, legacy_source="")
+
+    assert response.status_code == 422
+
+
+def test_malformed_legacy_source_missing_colon_rejected(client: TestClient):
+    headers = register_and_get_headers(client, "legacy14@example.com")
+
+    response = _upload(client, headers, legacy_source="not-a-valid-format")
+
+    assert response.status_code == 422
+
+
+def test_malformed_legacy_source_wrong_prefix_rejected(client: TestClient):
+    headers = register_and_get_headers(client, "legacy14b@example.com")
+
+    response = _upload(client, headers, legacy_source="document:abc")
+
+    assert response.status_code == 422
+
+
+def test_invalid_legacy_created_at_rejected(client: TestClient):
+    headers = register_and_get_headers(client, "legacy15@example.com")
+
+    response = _upload(client, headers, legacy_source="image:baddate", legacy_created_at="not-a-date")
+
+    assert response.status_code == 422
+
+
+def test_rename_still_works_for_legacy_media(client: TestClient):
+    headers = register_and_get_headers(client, "legacy16@example.com")
+    created = _upload(client, headers, legacy_source="image:rename-me").json()
+
+    response = client.patch(f"/media/{created['id']}", json={"title": "Migrated photo"}, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "Migrated photo"
+    assert response.json()["legacy_source"] == "image:rename-me"  # untouched by rename
+
+
+def test_delete_still_works_for_legacy_media(client: TestClient, storage):
+    headers = register_and_get_headers(client, "legacy17@example.com")
+    created = _upload(client, headers, legacy_source="image:delete-me").json()
+
+    response = client.delete(f"/media/{created['id']}", headers=headers)
+
+    assert response.status_code == 204
+    assert storage.count() == 0
+    assert client.get(f"/media/{created['id']}", headers=headers).status_code == 404
+
+
+def test_get_media_list_still_works_alongside_legacy_fields(client: TestClient):
+    headers = register_and_get_headers(client, "legacy18@example.com")
+    _upload(client, headers, filename="a.png")
+    _upload(client, headers, filename="b.png", legacy_source="image:b")
+
+    response = client.get("/media", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+
+
+def test_get_media_detail_still_works_alongside_legacy_fields(client: TestClient):
+    headers = register_and_get_headers(client, "legacy19@example.com")
+    created = _upload(client, headers, legacy_source="image:detail").json()
+
+    response = client.get(f"/media/{created['id']}", headers=headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["legacy_source"] == "image:detail"
+    assert "download_url" in body
+
+
+def test_upload_response_contains_agreed_legacy_fields(client: TestClient):
+    headers = register_and_get_headers(client, "legacy20@example.com")
+
+    response = _upload(client, headers)
+
+    body = response.json()
+    assert "legacy_source" in body
+    assert "legacy_created_at" in body
+
+
+def test_upload_success_then_lost_response_retry_resolves_to_same_asset(client: TestClient, storage):
+    """
+    The exact scenario named in the PHASE14I-B contract: the first request
+    succeeds server-side, but the client never receives the response (a
+    dropped connection, a timeout, ...) and retries the identical request.
+    The retry must resolve to the SAME MediaAsset and must not create a
+    second object or a second row.
+    """
+    headers = register_and_get_headers(client, "legacy21@example.com")
+
+    first_response = _upload(client, headers, legacy_source="image:lost-response")
+    assert first_response.status_code == 201
+    first_id = first_response.json()["id"]
+    assert storage.count() == 1
+
+    # Simulated retry: the client never saw `first_response`, so it
+    # resends the exact same multipart request.
+    retry_response = _upload(client, headers, legacy_source="image:lost-response")
+
+    assert retry_response.status_code == 201
+    assert retry_response.json()["id"] == first_id
+    assert storage.count() == 1  # no second object
+    assert client.get("/media", headers=headers).json()["total"] == 1  # no second row
+
+
+def test_race_backstop_resolves_to_winning_row_and_cleans_up_orphan(db_session, storage, monkeypatch):
+    """
+    Service-level test for the TRUE concurrent-race backstop (module
+    docstring, point 2) — not the simpler lost-response retry above,
+    which the pre-check alone already resolves. This simulates the
+    narrower window a real race opens: two requests both pass the
+    pre-check (because neither row exists yet when either checks), both
+    upload their own storage object, and then race to insert; the
+    database's unique index lets exactly one win.
+
+    tests/conftest.py's SQLite test database uses one shared connection
+    (StaticPool) for the whole process, so an actual multi-threaded
+    concurrent transaction can't be driven through the HTTP layer here —
+    see app/services/media_service.py's module docstring for that
+    documented limitation. This test instead drives the same code path
+    deterministically: the pre-check is made to report "no row yet" once
+    (simulating the race window), the second request's INSERT is made to
+    raise the same IntegrityError the real unique index would raise for a
+    genuine concurrent duplicate, and a "winning" row — standing in for
+    what a concurrent request would have already committed — is resolved
+    to and returned, while this request's own now-orphaned object is
+    cleaned up.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.repositories import media_repository
+    from app.services import media_service
+
+    user_id = uuid.uuid4()
+
+    winning_asset = media_repository.create(
+        db_session,
+        user_id=user_id,
+        media_type="image",
+        original_filename="winner.png",
+        object_key="image/winner/already-committed.png",
+        content_type="image/png",
+        file_size=5,
+        duration_seconds=None,
+        legacy_source="image:race",
+        legacy_created_at=None,
+    )
+    db_session.commit()
+
+    real_lookup = media_repository.get_by_user_and_legacy_source
+    lookup_calls = {"count": 0}
+
+    def _pre_check_misses_then_finds_winner(db, *, user_id, legacy_source):
+        lookup_calls["count"] += 1
+        if lookup_calls["count"] == 1:
+            return None  # the pre-check: simulates the race window (no row yet)
+        return real_lookup(db, user_id=user_id, legacy_source=legacy_source)
+
+    monkeypatch.setattr(media_repository, "get_by_user_and_legacy_source", _pre_check_misses_then_finds_winner)
+
+    def _insert_loses_the_race(*args, **kwargs):
+        raise IntegrityError("insert", {}, Exception("UNIQUE constraint failed: media_assets.user_id, media_assets.legacy_source"))
+
+    monkeypatch.setattr(media_repository, "create", _insert_loses_the_race)
+
+    result = media_service.upload_media(
+        db_session,
+        storage,
+        user_id=user_id,
+        data=b"loser bytes",
+        content_type="image/png",
+        original_filename="loser.png",
+        duration_seconds=None,
+        legacy_source="image:race",
+        legacy_created_at=None,
+    )
+
+    assert result.id == winning_asset.id  # resolved to the winner, not a 409/500
+    # the loser's own uploaded object was compensated away; the winner's
+    # object_key was never actually written to this fake bucket by this
+    # test, so zero remaining objects is direct evidence of that cleanup.
+    assert storage.count() == 0
+
+
+def test_migration_upgrade_and_downgrade_add_legacy_source(tmp_path, monkeypatch):
+    """
+    Test 22: runs the ACTUAL Alembic migration chain (not
+    Base.metadata.create_all(), which every other test in this suite uses
+    per tests/conftest.py's documented Phase 1 trade-off) against a
+    throwaway SQLite file, verifying this migration's upgrade() adds
+    exactly the expected column/index shape — including that the partial
+    unique index really does allow multiple NULLs and really does reject
+    a duplicate non-null legacy_source — and that downgrade() removes
+    everything it added, cleanly.
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy import create_engine, inspect, text
+
+    from app.core.config import settings
+
+    db_path = tmp_path / "phase14ib_migration_test.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", db_url)
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    alembic_cfg = Config(str(backend_dir / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+
+    command.upgrade(alembic_cfg, "head")
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    columns = {c["name"] for c in inspector.get_columns("media_assets")}
+    assert "legacy_source" in columns
+    assert "legacy_created_at" in columns
+    assert any(
+        ix["name"] == "uq_media_assets_user_id_legacy_source" and ix["unique"]
+        for ix in inspector.get_indexes("media_assets")
+    )
+
+    # Multiple NULLs must remain valid; a duplicate non-null legacy_source
+    # for the same user must be rejected at the database level.
+    with engine.begin() as conn:
+        user_id = uuid.uuid4().hex
+        base_cols = "id, user_id, media_type, object_key, content_type, file_size, legacy_source"
+        conn.execute(
+            text(f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, NULL)"),
+            {"id": uuid.uuid4().hex, "uid": user_id, "key": "k1"},
+        )
+        conn.execute(
+            text(f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, NULL)"),
+            {"id": uuid.uuid4().hex, "uid": user_id, "key": "k2"},
+        )
+        conn.execute(
+            text(
+                f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, 'image:mig')"
+            ),
+            {"id": uuid.uuid4().hex, "uid": user_id, "key": "k3"},
+        )
+        with pytest.raises(Exception):
+            conn.execute(
+                text(
+                    f"INSERT INTO media_assets ({base_cols}) VALUES (:id, :uid, 'image', :key, 'image/png', 1, 'image:mig')"
+                ),
+                {"id": uuid.uuid4().hex, "uid": user_id, "key": "k4"},
+            )
+    engine.dispose()
+
+    command.downgrade(alembic_cfg, "-1")
+
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+    columns_after_downgrade = {c["name"] for c in inspector.get_columns("media_assets")}
+    assert "legacy_source" not in columns_after_downgrade
+    assert "legacy_created_at" not in columns_after_downgrade
+    engine.dispose()

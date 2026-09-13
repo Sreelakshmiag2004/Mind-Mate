@@ -1,7 +1,8 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -11,7 +12,7 @@ from app.dependencies.auth import get_current_active_user
 from app.dependencies.pagination import PaginationParams, pagination_params
 from app.models.user import User
 from app.schemas.common import Page
-from app.schemas.media import MediaAssetDetail, MediaAssetRead, MediaAssetUpdate
+from app.schemas.media import MediaAssetDetail, MediaAssetRead, MediaAssetUpdate, MediaUploadLegacyFields
 from app.services import media_service
 from app.services.media_service import DOWNLOAD_URL_EXPIRES_IN_SECONDS
 from app.services.storage import ObjectStorageService, get_storage_service
@@ -26,17 +27,60 @@ router = APIRouter(prefix="/media", tags=["media"])
     summary="Upload a voice note, image, or video",
     description=(
         "Direct multipart upload. `media_type` is derived server-side from the file's content type — "
-        "never trust a client-declared type. See backend/README.md for the exact allow-list and the size limit."
+        "never trust a client-declared type. See backend/README.md for the exact allow-list and the size limit. "
+        "PHASE14I-B: optionally accepts `legacy_source`/`legacy_created_at` for the Vault legacy-Hive-media "
+        "migration; omit both for a normal upload. Duplicate-safe: a repeated request with the same "
+        "`legacy_source` for this user returns the existing MediaAsset rather than creating another one — "
+        "see backend/README.md."
     ),
 )
 async def upload_media(
+    request: Request,
     file: UploadFile = File(...),
     duration_seconds: Optional[int] = Form(default=None, ge=0, description="Only meaningful for voice/video; client-reported, display-only"),
+    legacy_source: Optional[str] = Form(
+        default=None,
+        description=(
+            "PHASE14I-B, optional. One of 'image:<id>' / 'voice:<id>' / 'video:<id>' identifying the legacy "
+            "Hive record this upload migrates. Omit for a normal upload. A repeated upload with a "
+            "legacy_source already recorded for this user returns the existing MediaAsset unchanged."
+        ),
+    ),
+    legacy_created_at: Optional[str] = Form(
+        default=None,
+        description=(
+            "PHASE14I-B, optional. The original Hive DateTime as an ISO-8601 string, preserved verbatim in "
+            "legacy_created_at. Send it already converted to UTC (e.g. Dart's `.toUtc().toIso8601String()`) — "
+            "see backend/README.md for why a naive value cannot be safely reinterpreted server-side."
+        ),
+    ),
     db: Session = Depends(get_db),
     storage: ObjectStorageService = Depends(get_storage_service),
     current_user: User = Depends(get_current_active_user),
 ) -> MediaAssetRead:
     data = await file.read()
+
+    # FastAPI's own Form-parameter binding treats an explicitly-submitted
+    # BLANK multipart field the same as an omitted one for any Optional
+    # Form field (see fastapi.dependencies.utils._get_multidict_value:
+    # `value == ""` is coerced to the field's default) — so by the time
+    # `legacy_source` above is bound, "the field was present but blank"
+    # and "the field was never sent" are already indistinguishable. That
+    # collapse is exactly wrong for `legacy_source`: an explicit blank
+    # must be rejected with 422 (PHASE14I-B contract), not silently
+    # treated as "normal upload." Re-reading the raw multipart form here
+    # recovers the distinction before it's lost.
+    raw_form = await request.form()
+    if "legacy_source" in raw_form:
+        legacy_source = raw_form.get("legacy_source")
+
+    try:
+        legacy_fields = MediaUploadLegacyFields(legacy_source=legacy_source, legacy_created_at=legacy_created_at)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[{"loc": err["loc"], "msg": err["msg"], "type": err["type"]} for err in exc.errors()],
+        )
 
     try:
         # `media_service.upload_media` makes a blocking network call to
@@ -55,6 +99,8 @@ async def upload_media(
             content_type=file.content_type,
             original_filename=file.filename,
             duration_seconds=duration_seconds,
+            legacy_source=legacy_fields.legacy_source,
+            legacy_created_at=legacy_fields.legacy_created_at,
         )
     except UnsupportedMediaTypeError as exc:
         raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc))
@@ -70,16 +116,27 @@ async def upload_media(
     "",
     response_model=Page[MediaAssetRead],
     summary="List your media",
-    description="Only the authenticated user's own uploads. Optional `media_type` filter (voice/image/video).",
+    description=(
+        "Only the authenticated user's own uploads. Optional `media_type` filter (voice/image/video). "
+        "PHASE14I-B: optional exact-match `legacy_source` filter for the Vault legacy-Hive-media migration "
+        "lookup — e.g. `GET /media?legacy_source=image:abc` — returns that one item if this user has already "
+        "migrated it, or an empty page if not. Never returns another user's matching legacy_source."
+    ),
 )
 def list_media(
     media_type: Optional[str] = Query(default=None, pattern="^(voice|image|video)$"),
+    legacy_source: Optional[str] = Query(default=None, max_length=300),
     pagination: PaginationParams = Depends(pagination_params),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> Page[MediaAssetRead]:
     items, total = media_service.list_media(
-        db, user_id=current_user.id, media_type=media_type, limit=pagination.limit, offset=pagination.offset
+        db,
+        user_id=current_user.id,
+        media_type=media_type,
+        legacy_source=legacy_source,
+        limit=pagination.limit,
+        offset=pagination.offset,
     )
     return Page[MediaAssetRead](
         items=[MediaAssetRead.model_validate(item) for item in items],

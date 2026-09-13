@@ -37,14 +37,62 @@ Consistency between PostgreSQL and object storage (see backend/README.md,
     pointing at a gone object — a narrower, more detectable failure than
     a fully untracked orphaned blob, which is why this ordering was
     chosen over deleting the row first.
+
+PHASE14I-B — duplicate-safe legacy upload (see the PHASE14I-B
+implementation report for the full contract this section implements):
+
+`upload_media` now accepts optional `legacy_source`/`legacy_created_at`
+for the eventual one-time Flutter Vault -> backend legacy Hive media
+migration. When `legacy_source` is given, this function guarantees that
+the same `(user_id, legacy_source)` can never end up as two `MediaAsset`
+rows or two storage objects, even across a lost-response retry or a true
+concurrent race:
+
+  1. Pre-check: before touching storage at all, look up an existing row
+     for this exact `(user_id, legacy_source)`. If one exists, return it
+     immediately — no new object is uploaded, no new row is created. This
+     alone handles the common non-concurrent case (client uploaded
+     successfully, the response was lost — e.g. a flaky mobile network —
+     and the same request is retried).
+  2. This pre-check cannot close a true concurrent race (two requests can
+     both pass it before either has inserted). The
+     `uq_media_assets_user_id_legacy_source` partial unique index (see
+     app/models/media_asset.py) is the mandatory final backstop: it lets
+     at most one of two racing inserts succeed. The losing request's
+     insert raises `IntegrityError`; this function catches specifically
+     that (not the broader `SQLAlchemyError` catch-all below, which
+     covers everything else — e.g. a lost DB connection), deletes its own
+     now-orphaned storage object as compensation, then re-resolves via
+     the same lookup as step 1 to return the *winning* request's row.
+     Both requests therefore resolve to the same logical `MediaAsset`,
+     matching the contract's preferred behavior over surfacing a 409 to
+     a client that will just retry anyway.
+
+Limitation (also called out in the implementation report): step 2's
+`IntegrityError` handling assumes that when `legacy_source` is set,
+`uq_media_assets_user_id_legacy_source` is the only unique constraint an
+`upload_media` insert could violate — true today (it is the only
+per-user uniqueness rule this table has), but if a future change adds
+another unique constraint reachable from this same insert, this handler
+would need to distinguish which constraint fired (e.g. by inspecting the
+driver error) rather than assuming. True concurrent-insert behavior is
+also not exercised by an automated test here: this project's test suite
+runs against a single-threaded, single-connection SQLite database (see
+tests/conftest.py), which cannot actually run two DB transactions in
+parallel. The two-sequential-requests "lost response, retried" scenario
+*is* covered directly; genuine concurrency is instead handled by relying
+on the database constraint (proven correct at the schema level, since it
+is a real, always-enforced uniqueness rule) rather than on a
+would-be-approximate test.
 """
 
 import logging
 import uuid
+from datetime import datetime
 from io import BytesIO
 from typing import Optional, Sequence
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -99,7 +147,19 @@ def upload_media(
     content_type: Optional[str],
     original_filename: Optional[str],
     duration_seconds: Optional[int],
+    legacy_source: Optional[str] = None,
+    legacy_created_at: Optional[datetime] = None,
 ) -> MediaAsset:
+    # PHASE14I-B duplicate-safe pre-check — see module docstring, point 1.
+    # Deliberately BEFORE any storage I/O: a lost-response retry for an
+    # already-migrated legacy_source should never upload a second object.
+    if legacy_source is not None:
+        existing = media_repository.get_by_user_and_legacy_source(
+            db, user_id=user_id, legacy_source=legacy_source
+        )
+        if existing is not None:
+            return existing
+
     media_type, extension = _validate_and_read(content_type, data)
 
     # Server-generated, UUID-based — never derived from `original_filename`,
@@ -120,10 +180,35 @@ def upload_media(
             content_type=content_type,
             file_size=len(data),
             duration_seconds=duration_seconds,
+            legacy_source=legacy_source,
+            legacy_created_at=legacy_created_at,
         )
         db.commit()
         db.refresh(asset)
         return asset
+    except IntegrityError:
+        # PHASE14I-B race backstop — see module docstring, point 2. Only
+        # ever expected here when legacy_source is set: the
+        # (user_id, legacy_source) partial unique index is the only
+        # per-user uniqueness rule this table has, so a concurrent
+        # request for the exact same legacy_source is the only thing this
+        # insert could lose a race against.
+        db.rollback()
+        try:
+            storage.delete(object_key=object_key)  # this request's object is now orphaned
+        except StorageError:
+            logger.error(
+                "Orphaned object after losing a legacy_source insert race: object_key=%s could not be cleaned up",
+                object_key,
+            )
+
+        if legacy_source is not None:
+            winner = media_repository.get_by_user_and_legacy_source(
+                db, user_id=user_id, legacy_source=legacy_source
+            )
+            if winner is not None:
+                return winner
+        raise
     except SQLAlchemyError:
         db.rollback()
         try:
@@ -144,9 +229,17 @@ def get_media(db: Session, *, user_id: uuid.UUID, media_id: uuid.UUID) -> MediaA
 
 
 def list_media(
-    db: Session, *, user_id: uuid.UUID, media_type: Optional[str], limit: int, offset: int
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    media_type: Optional[str],
+    limit: int,
+    offset: int,
+    legacy_source: Optional[str] = None,
 ) -> tuple[Sequence[MediaAsset], int]:
-    return media_repository.list_for_user(db, user_id=user_id, media_type=media_type, limit=limit, offset=offset)
+    return media_repository.list_for_user(
+        db, user_id=user_id, media_type=media_type, legacy_source=legacy_source, limit=limit, offset=offset
+    )
 
 
 def build_download_url(storage: ObjectStorageService, asset: MediaAsset) -> str:
